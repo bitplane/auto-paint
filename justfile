@@ -7,6 +7,6 @@ release level="patch":
 release-resume:
     bash scripts/finish-release.sh
 
-# Run the same pinned-toolchain and MSRV checks as CI.
+# Run the same checks as CI.
 check:
     bash scripts/check.sh

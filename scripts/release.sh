@@ -56,7 +56,14 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-sed -i "0,/^version = \"$current\"$/s//version = \"$version\"/" Cargo.toml
+python3 - "$current" "$version" <<'PY_BUMP'
+from pathlib import Path
+import sys
+
+manifest = Path("Cargo.toml")
+old, new = sys.argv[1:]
+manifest.write_text(manifest.read_text().replace(f'version = "{old}"', f'version = "{new}"', 1))
+PY_BUMP
 cargo check
 cargo publish --dry-run --allow-dirty --locked
 git add Cargo.toml Cargo.lock

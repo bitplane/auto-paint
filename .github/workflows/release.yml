@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check tag and package
+        shell: bash
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]]
+          cargo publish --dry-run --locked
+
+  test:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  bundle:
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x86_64
+            binary: target/release/auto-paint
+          - runner: windows-2025
+            platform: windows-x86_64
+            binary: target/release/auto-paint.exe
+          - runner: macos-15
+            platform: macos-aarch64
+            binary: target/release/auto-paint
+          - runner: macos-15-intel
+            platform: macos-x86_64
+            binary: target/release/auto-paint
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: cargo build --locked --release
+      - run: python scripts/package.py ${{ matrix.platform }} ${{ matrix.binary }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: auto-paint-${{ matrix.platform }}
+          path: target/dist/auto-paint-*
+          if-no-files-found: error
+
+  github-release:
+    needs: bundle
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: auto-paint-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish release binaries
+        working-directory: release-assets
+        shell: bash
+        run: |
+          sha256sum --check -- *.sha256
+          assets=()
+          for platform in linux-x86_64 windows-x86_64 macos-aarch64 macos-x86_64; do
+            suffix=tar.gz
+            if [[ "$platform" == windows-* ]]; then suffix=zip; fi
+            archive="auto-paint-${TAG#v}-$platform.$suffix"
+            [[ -f "$archive" && -f "$archive.sha256" ]]
+            assets+=("$archive" "$archive.sha256")
+          done
+          if existing=$(gh release view "$TAG" --json assets --jq '.assets[].name'); then
+            missing=()
+            for asset in "${assets[@]}"; do
+              if ! grep -Fxq "$asset" <<< "$existing"; then missing+=("$asset"); fi
+            done
+            if (( ${#missing[@]} )); then gh release upload "$TAG" "${missing[@]}"; fi
+          else
+            gh release create "$TAG" --verify-tag --generate-notes -- "${assets[@]}"
+          fi
+
+  crates-io:
+    needs: bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

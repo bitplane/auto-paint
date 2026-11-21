@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    branches: [master]
   pull_request:
   workflow_call:
 
@@ -14,10 +14,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, windows-2025, macos-15, macos-15-intel]
+        include:
+          - runner: ubuntu-24.04
+            binary: target/release/auto-paint
+          - runner: windows-2025
+            binary: target/release/auto-paint.exe
+          - runner: macos-15
+            binary: target/release/auto-paint
+          - runner: macos-15-intel
+            binary: target/release/auto-paint
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
       - run: bash scripts/check.sh
+      - run: cargo build --locked --release
+      - name: Record a drawing
+        run: python scripts/smoke.py ${{ matrix.binary }}
+      - name: Install video and window test tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg xvfb xauth libxkbcommon-x11-0
+      - name: Watch a drawing and decode the MP4
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python scripts/smoke.py ${{ matrix.binary }} --watch --narrate --ffprobe
