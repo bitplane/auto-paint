@@ -127,6 +127,7 @@ dependencies = [
  "base64",
  "clap",
  "flite-rs",
+ "fontdue",
  "getrandom 0.4.3",
  "muxide",
  "openh264",

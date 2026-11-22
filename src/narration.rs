@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{FPS, Result};
 use muxide::api::Muxer;
 use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, write_adts_header};
 use std::io::Write;
@@ -7,36 +7,68 @@ use std::time::Duration;
 pub const SAMPLE_RATE: u32 = 16_000;
 const AAC_FRAME: usize = 1024;
 
-pub struct Cue {
-    pub at: Duration,
-    pub text: String,
+struct Cue {
+    start: u64,
+    end: u64,
+    text: String,
 }
 
-pub struct Audio {
+pub struct Narration {
+    engine: flite_rs::Engine,
     samples: Vec<i16>,
+    cues: Vec<Cue>,
 }
 
-pub fn synthesize(cues: &[Cue]) -> Result<Audio> {
-    let mut samples = Vec::new();
-    if !cues.is_empty() {
+impl Narration {
+    pub fn new() -> Result<Self> {
         let mut engine = flite_rs::Engine::new();
         if !engine.select_voice("kal16") {
             return Err("The embedded Flite voice is unavailable".into());
         }
-        for cue in cues {
-            let offset = (cue.at.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize;
-            if offset < samples.len() {
-                continue;
-            }
-            let voice = engine.synthesize(&cue.text);
-            samples.resize(offset, 0);
-            samples.extend(voice.samples);
-        }
+        Ok(Self {
+            engine,
+            samples: Vec::new(),
+            cues: Vec::new(),
+        })
     }
-    Ok(Audio { samples })
-}
 
-impl Audio {
+    pub fn add(&mut self, at: Duration, text: &str) {
+        let offset = (at.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize;
+        if offset < self.samples.len() || self.cues.len() == 128 {
+            return;
+        }
+        let text: String = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        let voice = self.engine.synthesize(&text);
+        if voice.samples.is_empty() {
+            return;
+        }
+        self.samples.resize(offset, 0);
+        self.samples.extend(voice.samples);
+        self.cues.push(Cue {
+            start: offset as u64,
+            end: self.samples.len() as u64,
+            text,
+        });
+    }
+
+    pub fn subtitle_at(&self, frame: u64) -> Option<&str> {
+        // The AAC track retains one frame of encoder priming.
+        let sample =
+            (frame * u64::from(SAMPLE_RATE) / u64::from(FPS)).checked_sub(AAC_FRAME as u64)?;
+        let next = self.cues.partition_point(|cue| cue.start <= sample);
+        let cue = self.cues.get(next.checked_sub(1)?)?;
+        (sample < cue.end).then_some(cue.text.as_str())
+    }
+
     pub fn duration(&self) -> f64 {
         self.samples.len() as f64 / f64::from(SAMPLE_RATE)
     }

@@ -52,6 +52,7 @@ def main():
         (args.binary, "auto-paint.exe" if windows else "auto-paint"),
         (Path("README.md"), "README.md"),
         (Path("LICENSE"), "LICENSE"),
+        (Path("assets/Liberation-LICENSE.txt"), "licenses/Liberation-LICENSE.txt"),
         *licenses(),
     ]
     if windows:

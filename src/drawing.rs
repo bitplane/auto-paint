@@ -1,6 +1,6 @@
 use crate::codex::{self, Event, Process};
 use crate::mcp::{Action, Batch, Button, Point, Server};
-use crate::narration::Cue;
+use crate::narration::Narration;
 use crate::video::Video;
 use crate::{FPS, HEIGHT, Result, Run, WIDTH};
 use paintrs::automation::{Modifiers, NamedKey, Session};
@@ -43,14 +43,14 @@ struct Drawing<'a, P> {
     last_frame: Option<u64>,
     deadline: Instant,
     pointer: Point,
-    cues: Vec<Cue>,
-    narrate: bool,
+    narration: Option<Narration>,
 }
 
 impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
     fn new(run: &Run, cancelled: &'a AtomicBool, preview: P) -> Result<Self> {
         let video = Video::new(&run.output.join(".drawing.mp4"), run.options.narrate)?;
         let session = Session::new(WIDTH, HEIGHT)?;
+        let narration = run.options.narrate.then(Narration::new).transpose()?;
         let now = Instant::now();
         let mut drawing = Self {
             session,
@@ -61,8 +61,7 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
             last_frame: None,
             deadline: now + RUN_LIMIT,
             pointer: Point { x: -1, y: -1 },
-            cues: Vec::new(),
-            narrate: run.options.narrate,
+            narration,
         };
         drawing.render();
         drawing.sample()?;
@@ -84,7 +83,7 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
             (now.duration_since(self.start).as_nanos() * u128::from(FPS) / 1_000_000_000) as u64
         };
         if self.last_frame.is_none_or(|last| frame > last) {
-            self.video.write(self.session.pixels(), frame)?;
+            self.write_frame(frame)?;
             self.last_frame = Some(frame);
         }
         Ok(())
@@ -174,13 +173,17 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
     }
 
     fn cue(&mut self, line: &str) {
-        let line = line.trim();
-        if self.narrate && !line.is_empty() && self.cues.len() < 128 {
-            self.cues.push(Cue {
-                at: self.start.elapsed(),
-                text: line.chars().take(200).collect(),
-            });
+        if let Some(narration) = &mut self.narration {
+            narration.add(self.start.elapsed(), line);
         }
+    }
+
+    fn write_frame(&mut self, frame: u64) -> Result<()> {
+        let subtitle = self
+            .narration
+            .as_ref()
+            .and_then(|voice| voice.subtitle_at(frame));
+        self.video.write(self.session.pixels(), frame, subtitle)
     }
 
     fn act(&mut self, action: Action) -> Result<()> {
@@ -299,15 +302,15 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
         self.session.move_pointer(-1, -1);
         self.render();
         let video_duration = self.start.elapsed().as_secs_f64();
-        let audio = crate::narration::synthesize(&self.cues)?;
+        let audio_duration = self.narration.as_ref().map_or(0.0, Narration::duration);
         let mut frame = self.last_frame.unwrap_or(0) + 1;
         let tail =
-            (video_duration.max(audio.duration()) * f64::from(FPS)).ceil() as u64 + u64::from(FPS);
+            (video_duration.max(audio_duration) * f64::from(FPS)).ceil() as u64 + u64::from(FPS);
         while frame <= tail {
-            self.video.write(self.session.pixels(), frame)?;
+            self.write_frame(frame)?;
             frame += 1;
         }
-        self.video.finish(audio)?;
+        self.video.finish(self.narration)?;
         std::fs::rename(
             run.output.join(".drawing.mp4"),
             run.output.join("drawing.mp4"),

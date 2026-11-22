@@ -2,6 +2,7 @@ mod codex;
 mod drawing;
 mod mcp;
 mod narration;
+mod subtitles;
 mod video;
 mod watch;
 
@@ -36,7 +37,7 @@ struct Options {
     /// Record with no visible window.
     #[arg(long)]
     no_watch: bool,
-    /// Add an offline English voiceover to the recording.
+    /// Add an offline English voiceover and subtitles to the recording.
     #[arg(long)]
     narrate: bool,
     /// Maximum number of screenshot and action batches.
