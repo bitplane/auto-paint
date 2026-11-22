@@ -81,7 +81,7 @@ impl<'a> Drawing<'a> {
             preview,
             cancelled,
             start: None,
-            trim_waits: run.options.trim_waits,
+            trim_waits: !run.options.real_time,
             wait_cutoff: None,
             last_frame: None,
             deadline: now + RUN_LIMIT,
@@ -540,7 +540,7 @@ mod tests {
     fn a_model_wait_keeps_speech_and_a_short_pause() -> Result<()> {
         let workspace = crate::harness::Workspace::new()?;
         let run = Run {
-            options: crate::Options::parse_from(["auto-paint", "--trim-waits"]),
+            options: crate::Options::parse_from(["auto-paint"]),
             model: String::new(),
             output: workspace.0.clone(),
             prompt: String::new(),
