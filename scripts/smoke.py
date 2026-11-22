@@ -7,9 +7,9 @@ import subprocess
 import tempfile
 
 
-def subtitle_strip(video, seek):
+def subtitle_region(video, seek):
     return subprocess.check_output(
-        ["ffmpeg", "-v", "error", *seek, "-i", video, "-vf", "crop=iw:96:0:700",
+        ["ffmpeg", "-v", "error", *seek, "-i", video, "-vf", "crop=480:96:260:586",
          "-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-"],
         timeout=30,
     )
@@ -45,12 +45,18 @@ def main():
             expected = {"h264", "aac"} if args.narrate else {"h264"}
             assert {stream["codec_name"] for stream in streams} == expected
             picture = next(stream for stream in streams if stream["codec_name"] == "h264")
-            assert picture["height"] == (796 if args.narrate else 700)
+            assert (picture["width"], picture["height"]) == (1000, 700)
             if args.narrate:
-                speaking = subtitle_strip(video, ["-ss", "1"])
-                finished = subtitle_strip(video, ["-sseof", "-0.25"])
-                assert max(speaking, default=0) > 200, "Subtitle missing during speech"
-                assert finished and max(finished) < 50, "Subtitle remained after speech"
+                before = subtitle_region(video, ["-ss", "0"])
+                speaking = subtitle_region(video, ["-ss", "1"])
+                finished = subtitle_region(video, ["-sseof", "-0.25"])
+                assert len(before) == len(speaking) == len(finished) == 480 * 96
+                white = sum(now > 220 and now - old > 20 for old, now in zip(before, speaking))
+                outline = sum(now < 50 and old > 80 for old, now in zip(before, speaking))
+                assert white > 50, "White subtitle text missing during speech"
+                assert outline > 50, "Dark subtitle outline missing during speech"
+                changed = sum(abs(old - new) > 30 for old, new in zip(before, finished))
+                assert changed < len(before) // 100, "Subtitle remained after speech"
             subprocess.run(
                 ["ffmpeg", "-v", "error", "-xerror", "-i", video, "-f", "null", "-"],
                 check=True,

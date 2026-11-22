@@ -1,5 +1,5 @@
 use crate::narration::{Narration, SAMPLE_RATE};
-use crate::subtitles::{BACKGROUND, STRIP_HEIGHT, Subtitles};
+use crate::subtitles::Subtitles;
 use crate::{FPS, HEIGHT, Result, WIDTH};
 use muxide::api::{AacProfile, AudioCodec, Muxer, MuxerBuilder, VideoCodec};
 use openh264::encoder::{
@@ -19,7 +19,6 @@ pub struct Video {
     yuv: YUVBuffer,
     packet: Vec<u8>,
     subtitles: Option<Subtitles>,
-    height: u32,
 }
 
 impl Video {
@@ -32,10 +31,9 @@ impl Video {
             .skip_frames(false);
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)?;
         let subtitles = narrate.then(Subtitles::new).transpose()?;
-        let height = HEIGHT + if subtitles.is_some() { STRIP_HEIGHT } else { 0 };
         let file = BufWriter::new(File::create(path)?);
         let mut builder = MuxerBuilder::new(file)
-            .video(VideoCodec::H264, WIDTH, height, f64::from(FPS))
+            .video(VideoCodec::H264, WIDTH, HEIGHT, f64::from(FPS))
             .with_fast_start(true);
         if narrate {
             builder = builder.audio(AudioCodec::Aac(AacProfile::Lc), SAMPLE_RATE, 1);
@@ -45,33 +43,31 @@ impl Video {
             mux: builder.build()?,
             encoder,
             pixels: Vec::with_capacity(size),
-            rgb: vec![BACKGROUND; (WIDTH * height * 3) as usize],
-            yuv: YUVBuffer::new(WIDTH as usize, height as usize),
+            rgb: vec![0; size * 3],
+            yuv: YUVBuffer::new(WIDTH as usize, HEIGHT as usize),
             packet: Vec::new(),
             subtitles,
-            height,
         })
     }
 
     pub fn write(&mut self, pixels: &[u32], frame: u64, subtitle: Option<&str>) -> Result<()> {
-        let (scene, strip) = self.rgb.split_at_mut(pixels.len() * 3);
         let subtitle_changed = self
             .subtitles
             .as_mut()
-            .is_some_and(|subtitles| subtitles.update(subtitle, strip));
-        let scene_changed = self.pixels != pixels;
-        if scene_changed {
+            .is_some_and(|subtitles| subtitles.update(subtitle));
+        if self.pixels != pixels || subtitle_changed {
             self.pixels.clear();
             self.pixels.extend_from_slice(pixels);
-            for (rgb, &pixel) in scene.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+            for (rgb, &pixel) in self.rgb.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
                 let [_, r, g, b] = pixel.to_be_bytes();
                 *rgb = [r, g, b];
             }
-        }
-        if scene_changed || subtitle_changed {
+            if let Some(subtitles) = &self.subtitles {
+                subtitles.blend(&mut self.rgb);
+            }
             self.yuv.read_rgb8(RgbSliceU8::new(
                 &self.rgb,
-                (WIDTH as usize, self.height as usize),
+                (WIDTH as usize, HEIGHT as usize),
             ));
         }
         let timestamp = Timestamp::from_millis(frame * 1000 / u64::from(FPS));
