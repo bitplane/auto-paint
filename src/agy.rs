@@ -1,4 +1,5 @@
-use crate::harness::{self, Effort, Event, Model, Process};
+use crate::harness::{self, Effort, Event, Model, Process, Query};
+use crate::mcp::Server;
 use crate::{Result, Run};
 use serde_json::{Value, json};
 use std::fs;
@@ -52,7 +53,11 @@ fn parse_model(line: &str) -> Option<Model> {
 
 pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Result<Process> {
     let config = WorkspaceConfig::new(&run.output, true)?;
-    config.write_mcp(run, address)?;
+    let mut tools = vec!["screenshot", "act"];
+    if run.reference.is_some() {
+        tools.push("reference");
+    }
+    config.write_mcp(address, &tools)?;
     let mut command = exec_command(&run.output, run.model(), run.options.effort, true);
     command.env("AUTO_PAINT_MCP_TOKEN", token);
     let prompt = if run.reference.is_some() {
@@ -66,18 +71,23 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
     Ok(Process::spawn(command, &[], events)?.with_agy_config(config))
 }
 
-pub fn start_selection(
-    directory: &Path,
-    model: &str,
-    effort: Option<Effort>,
-    schema: &Path,
-    prompt: &str,
-) -> Result<Process> {
-    let config = WorkspaceConfig::new(directory, false)?;
-    let mut command = exec_command(directory, model, effort, false);
-    let schema = fs::read_to_string(schema)?;
+pub fn start_query(query: Query<'_>) -> Result<Process> {
+    let image = query.image;
+    let config = WorkspaceConfig::new(query.directory, image.is_some())?;
+    let mut command = exec_command(query.directory, query.model, query.effort, image.is_some());
+    let image_instruction = if let Some(image) = image {
+        let server = Server::bind()?;
+        config.write_mcp(server.address, &["reference"])?;
+        command.env("AUTO_PAINT_MCP_TOKEN", &server.token);
+        drop(server.start(0, Some(image.to_owned()))?);
+        "\nCall the Paintrs reference tool to see the image for this task."
+    } else {
+        ""
+    };
+    let schema = fs::read_to_string(query.schema)?;
     let prompt = format!(
-        "{prompt}\nReturn one JSON object matching the schema below. Include no Markdown or other text.\n{schema}"
+        "{}{image_instruction}\nReturn one JSON object matching the schema below. Include no Markdown or other text.\n{schema}",
+        query.prompt
     );
     command.arg("--print").arg(prompt);
     Ok(Process::spawn(command, &[], selection_events)?.with_agy_config(config))
@@ -143,18 +153,15 @@ impl WorkspaceConfig {
         Ok(config)
     }
 
-    fn write_mcp(&self, run: &Run, address: SocketAddr) -> Result<()> {
+    fn write_mcp(&self, address: SocketAddr, enabled_tools: &[&str]) -> Result<()> {
         let executable = std::env::current_exe()?;
         let executable = executable
             .to_str()
             .ok_or("Auto Paint's executable path must be UTF-8")?;
-        let mut tools = json!({"screenshot": {"eager": true}, "act": {"eager": true}});
-        if run.options.narrate {
-            tools["review"] = json!({"eager": true});
-        }
-        if run.reference.is_some() {
-            tools["reference"] = json!({"eager": true});
-        }
+        let tools: serde_json::Map<String, Value> = enabled_tools
+            .iter()
+            .map(|&name| (name.to_owned(), json!({"eager": true})))
+            .collect();
         let server = json!({"mcpServers": {"paintrs": {
             "command": executable,
             "args": ["--mcp-stdio", address.to_string()],
@@ -237,31 +244,10 @@ fn selection_events(value: &Value) -> Vec<Event> {
     let mut events = events(value);
     for event in &mut events {
         if let Event::Message(message) = event {
-            *message = json_reply(message).to_owned();
+            *message = harness::json_reply(message).to_owned();
         }
     }
     events
-}
-
-fn json_reply(message: &str) -> &str {
-    if serde_json::from_str::<Value>(message).is_ok() {
-        return message;
-    }
-    message
-        .split("```")
-        .skip(1)
-        .step_by(2)
-        .map(|block| {
-            let block = block.trim();
-            block
-                .strip_prefix("json")
-                .or_else(|| block.strip_prefix("JSON"))
-                .unwrap_or(block)
-                .trim()
-        })
-        .filter(|block| serde_json::from_str::<Value>(block).is_ok())
-        .last()
-        .unwrap_or(message)
 }
 
 #[cfg(test)]
@@ -281,7 +267,7 @@ mod tests {
     fn accepts_json_even_when_the_agent_wraps_it_in_markdown() {
         let json = r#"{"options":["Landscapes","Still lifes"]}"#;
         let fenced = format!("```json\n{json}\n```\n```json\n{json}\n```");
-        assert_eq!(json_reply(&fenced), json);
-        assert_eq!(json_reply(json), json);
+        assert_eq!(harness::json_reply(&fenced), json);
+        assert_eq!(harness::json_reply(json), json);
     }
 }

@@ -1,10 +1,11 @@
-use crate::{Result, Run, agy, claude, codex};
+use crate::{Result, Run, agy, claude, codex, opencode};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ pub enum Harness {
     Codex,
     Claude,
     Agy,
+    Opencode,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -43,6 +45,7 @@ impl Harness {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Agy => "agy",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -60,6 +63,11 @@ impl Harness {
                 let model = select_agy_model(&models, requested, effort)?;
                 println!("Model: {} (agy)", model.id);
                 return Ok(model.id.clone());
+            }
+            Self::Opencode => {
+                let model = opencode::resolve_model(directory, requested, effort)?;
+                println!("Model: {model} (opencode)");
+                return Ok(model);
             }
         };
         let query = requested.unwrap_or(family);
@@ -79,7 +87,7 @@ impl Harness {
         match self {
             Self::Codex => codex::check_login(),
             Self::Claude => claude::check_login(),
-            Self::Agy => Ok(()),
+            Self::Agy | Self::Opencode => Ok(()),
         }
     }
 
@@ -89,27 +97,29 @@ impl Harness {
             Self::Codex => codex::start(run, address, token, &prompt),
             Self::Claude => claude::start(run, address, token, &prompt),
             Self::Agy => agy::start(run, address, token, &prompt),
+            Self::Opencode => opencode::start(run, address, token, &prompt),
         }
     }
 
     pub fn structured_reply(
         self,
-        directory: &Path,
-        model: &str,
-        effort: Option<Effort>,
-        schema: &Path,
-        prompt: &str,
+        query: Query<'_>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<(String, Option<Value>)> {
         let mut process = match self {
-            Self::Codex => codex::start_selection(directory, model, effort, schema, prompt),
-            Self::Claude => claude::start_selection(directory, model, effort, schema, prompt),
-            Self::Agy => agy::start_selection(directory, model, effort, schema, prompt),
+            Self::Codex => codex::start_query(query),
+            Self::Claude => claude::start_query(query),
+            Self::Agy => agy::start_query(query),
+            Self::Opencode => opencode::start_query(query),
         }?;
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut message = None;
         let mut usage = None;
         let mut error = None;
         loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("Cancelled while waiting for a model response".into());
+            }
             let status = process.status()?;
             for event in process.events.try_iter() {
                 match event {
@@ -126,12 +136,15 @@ impl Harness {
                         .into());
                 }
                 return Ok((
-                    message.ok_or("The harness returned no subject suggestions")?,
+                    message.ok_or_else(|| {
+                        error
+                            .unwrap_or_else(|| "The harness returned no structured response".into())
+                    })?,
                     usage,
                 ));
             }
             if Instant::now() >= deadline {
-                return Err("Timed out waiting for subject suggestions".into());
+                return Err("Timed out waiting for a model response".into());
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -146,12 +159,42 @@ impl Harness {
     }
 }
 
+pub struct Query<'a> {
+    pub directory: &'a Path,
+    pub model: &'a str,
+    pub effort: Option<Effort>,
+    pub schema: &'a Path,
+    pub prompt: &'a str,
+    pub image: Option<&'a Path>,
+}
+
 pub struct Model {
     pub id: String,
     pub display_name: String,
 }
 
-fn match_model<'a>(
+pub fn json_reply(message: &str) -> &str {
+    if serde_json::from_str::<Value>(message).is_ok() {
+        return message;
+    }
+    message
+        .split("```")
+        .skip(1)
+        .step_by(2)
+        .map(|block| {
+            let block = block.trim();
+            block
+                .strip_prefix("json")
+                .or_else(|| block.strip_prefix("JSON"))
+                .unwrap_or(block)
+                .trim()
+        })
+        .filter(|block| serde_json::from_str::<Value>(block).is_ok())
+        .last()
+        .unwrap_or(message)
+}
+
+pub fn match_model<'a>(
     models: impl DoubleEndedIterator<Item = &'a Model> + Clone,
     query: &str,
 ) -> Option<&'a Model> {
@@ -318,8 +361,14 @@ pub struct Process<E = Event> {
 }
 
 impl<E: Send + 'static> Process<E> {
-    pub fn spawn(command: Command, input: &[u8], decode: fn(&Value) -> Vec<E>) -> Result<Self> {
-        let mut process = Self::open(command, decode)?;
+    pub fn spawn(
+        command: Command,
+        input: &[u8],
+        mut decode: impl FnMut(&Value) -> Vec<E> + Send + 'static,
+    ) -> Result<Self> {
+        let mut process = Self::open_lines(command, move |line| {
+            serde_json::from_str(line).map_or_else(|_| Vec::new(), |value| decode(&value))
+        })?;
         let mut stdin = process.child.stdin.take().expect("piped stdin");
         stdin.write_all(input)?;
         Ok(process)
@@ -333,7 +382,7 @@ impl<E: Send + 'static> Process<E> {
 
     pub fn open_lines(
         mut command: Command,
-        decode: impl Fn(&str) -> Vec<E> + Send + 'static,
+        mut decode: impl FnMut(&str) -> Vec<E> + Send + 'static,
     ) -> Result<Self> {
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command.spawn()?;
@@ -389,9 +438,8 @@ fn instructions(run: &Run) -> String {
         " At major drawing steps, use the act call's narration field for one short first-person line \
          about what you're doing in Paintrs. Use the latest screenshot. When a screenshot or tool result \
          shows a mistake, say what you got wrong and how you're fixing it. Skip routine clicks. \
-         Once the picture is finished, look at the final screenshot and call the Paintrs review tool \
-         exactly once. Deliver one short, mercilessly funny sentence about a specific flaw you can \
-         point to in your own drawing. Make the drawing the butt of the joke. End the turn after the review."
+         In your first act call, put the specific subject you intend to draw in the subject field. \
+         When the picture is finished, end the turn."
     } else {
         ""
     };

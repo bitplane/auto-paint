@@ -1,4 +1,4 @@
-use crate::harness::{self, Effort, Event, Model, ModelProbe, Process};
+use crate::harness::{self, Effort, Event, Model, ModelProbe, Process, Query};
 use crate::{Result, Run};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -120,12 +120,6 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
             &format!("{server}.tools.act.approval_mode=\"approve\""),
         ])
         .env("AUTO_PAINT_MCP_TOKEN", token);
-    if run.options.narrate {
-        command.args([
-            "-c",
-            &format!("{server}.tools.review.approval_mode=\"approve\""),
-        ]);
-    }
     if let Some(path) = &run.reference {
         command.arg("--image").arg(path);
     }
@@ -159,16 +153,13 @@ fn exec_command(directory: &Path, model: &str, effort: Option<Effort>) -> Comman
     command
 }
 
-pub fn start_selection(
-    directory: &Path,
-    model: &str,
-    effort: Option<Effort>,
-    schema: &Path,
-    prompt: &str,
-) -> Result<Process> {
-    let mut command = exec_command(directory, model, effort);
-    command.arg("--output-schema").arg(schema);
-    spawn(command, prompt)
+pub fn start_query(query: Query<'_>) -> Result<Process> {
+    let mut command = exec_command(query.directory, query.model, query.effort);
+    command.arg("--output-schema").arg(query.schema);
+    if let Some(image) = query.image {
+        command.arg("--image").arg(image);
+    }
+    spawn(command, query.prompt)
 }
 
 fn spawn(mut command: Command, prompt: &str) -> Result<Process> {

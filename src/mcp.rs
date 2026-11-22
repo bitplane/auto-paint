@@ -77,17 +77,18 @@ pub struct Batch {
     pub actions: Vec<Action>,
     #[serde(default)]
     pub narration: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 pub struct Request {
     pub command: Command,
-    pub reply: SyncSender<std::result::Result<Option<Vec<u8>>, String>>,
+    pub reply: SyncSender<std::result::Result<Vec<u8>, String>>,
 }
 
 pub enum Command {
     Screenshot,
     Act(Batch),
-    Review(String),
 }
 
 pub struct Server {
@@ -110,12 +111,7 @@ impl Server {
         })
     }
 
-    pub fn start(
-        self,
-        turns: u32,
-        narrate: bool,
-        reference: Option<PathBuf>,
-    ) -> Result<Receiver<Request>> {
+    pub fn start(self, turns: u32, reference: Option<PathBuf>) -> Result<Receiver<Request>> {
         self.listener.set_nonblocking(true)?;
         let (send, receive) = mpsc::sync_channel(1);
         thread::spawn(move || {
@@ -124,7 +120,7 @@ impl Server {
                 match self.listener.accept() {
                     Ok((connection, _)) => {
                         if let Err(error) =
-                            self.serve(connection, &send, turns, narrate, reference.as_deref())
+                            self.serve(connection, &send, turns, reference.as_deref())
                         {
                             eprintln!("Paintrs MCP: {error}");
                         }
@@ -148,7 +144,6 @@ impl Server {
         mut connection: TcpStream,
         send: &SyncSender<Request>,
         turns: u32,
-        narrate: bool,
         reference: Option<&Path>,
     ) -> Result<()> {
         connection.set_nonblocking(false)?;
@@ -180,17 +175,14 @@ impl Server {
                     "serverInfo": {"name": "paintrs", "version": env!("CARGO_PKG_VERSION")}
                 }),
                 Some("ping") => json!({}),
-                Some("tools/list") => json!({"tools": tools(narrate, reference.is_some())}),
+                Some("tools/list") => json!({"tools": tools(turns > 0, reference.is_some())}),
                 Some("tools/call") => match (params["name"].as_str(), reference) {
                     (Some("reference"), Some(path)) => match reference_image(path) {
                         Ok(image) => image,
                         Err(error) => tool_error(&error.to_string()),
                     },
-                    _ => match call(send, params, &mut remaining, narrate) {
-                        Ok(Some(image)) => image_response(&image, "image/png"),
-                        Ok(None) => {
-                            json!({"content": [{"type": "text", "text": "Final review recorded."}]})
-                        }
+                    _ => match call(send, params, &mut remaining) {
+                        Ok(image) => image_response(&image, "image/png"),
                         Err(error) => tool_error(&error),
                     },
                 },
@@ -231,32 +223,19 @@ fn call(
     send: &SyncSender<Request>,
     params: &Value,
     remaining: &mut u32,
-    narrate: bool,
-) -> std::result::Result<Option<Vec<u8>>, String> {
+) -> std::result::Result<Vec<u8>, String> {
     let command = match params["name"].as_str() {
         Some("screenshot") => Command::Screenshot,
         Some("act") => Command::Act(
             serde_json::from_value(params["arguments"].clone())
                 .map_err(|error| format!("Invalid actions: {error}"))?,
         ),
-        Some("review") if narrate => {
-            let line = params["arguments"]["narration"]
-                .as_str()
-                .unwrap_or("")
-                .trim();
-            if !(1..=200).contains(&line.chars().count()) {
-                return Err("The final review needs 1 to 200 characters".into());
-            }
-            Command::Review(line.to_owned())
-        }
         _ => return Err("Unknown Paintrs tool".into()),
     };
-    if !matches!(command, Command::Review(_)) {
-        if *remaining == 0 {
-            return Err("Reached the drawing step limit. Finish drawing.".into());
-        }
-        *remaining -= 1;
+    if *remaining == 0 {
+        return Err("Reached the drawing step limit. Finish drawing.".into());
     }
+    *remaining -= 1;
     let (reply, result) = mpsc::sync_channel(1);
     send.send(Request { command, reply })
         .map_err(|_| "The drawing session has ended")?;
@@ -265,54 +244,49 @@ fn call(
         .map_err(|_| "The drawing session did not respond")?
 }
 
-fn tools(narrate: bool, reference: bool) -> Vec<Value> {
-    let mut tools = vec![
-        json!({
-            "name": "screenshot",
-            "description": "See the entire Paintrs window. The coordinate origin is the top left.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
-            "annotations": {"readOnlyHint": true}
-        }),
-        json!({
-            "name": "act",
-            "description": "Perform mouse and keyboard actions in Paintrs and see the result. Clicks and moves take x and y. Drags take a path of x/y points. Keypress takes keys like ['CTRL','Z']. Type takes text. Scroll takes x, y and scroll_x or scroll_y. Wait takes milliseconds. For a polygon, choose the Polygon tool to the right of Rectangle. Drag the first edge only, then click each remaining vertex once and press Enter to close the shape. A single drag around the outline does not add vertices. Choose the bottom fill option before drawing for a solid foreground-color polygon.",
-            "inputSchema": {
-                "type": "object", "required": ["actions"], "additionalProperties": false,
-                "properties": {
-                    "actions": {"type": "array", "minItems": 1, "maxItems": 128, "items": {
-                        "type": "object", "required": ["type"], "additionalProperties": false,
-                        "properties": {
-                            "type": {"enum": ["move","click","double_click","drag","scroll","keypress","type","wait"]},
-                            "x": {"type": "integer"}, "y": {"type": "integer"},
-                            "button": {"enum": ["left", "right"]},
-                            "path": {"type": "array", "minItems": 2, "maxItems": 128, "items": {
-                                "type": "object", "required": ["x", "y"], "additionalProperties": false,
-                                "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}
-                            }},
-                            "scroll_x": {"type": "integer"}, "scroll_y": {"type": "integer"},
-                            "keys": {"type": "array", "items": {"type": "string"}},
-                            "text": {"type": "string"}, "milliseconds": {"type": "integer"}
-                        }
-                    }},
-                    "narration": {"type": "string", "maxLength": 200, "description": "One short first-person line about what you're doing, including how you're fixing any mistake the screenshot or tool result showed."}
+fn tools(drawing: bool, reference: bool) -> Vec<Value> {
+    let mut tools = if drawing {
+        vec![
+            json!({
+                "name": "screenshot",
+                "description": "See the entire Paintrs window. The coordinate origin is the top left.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+                "annotations": {"readOnlyHint": true}
+            }),
+            json!({
+                "name": "act",
+                "description": "Perform mouse and keyboard actions in Paintrs and see the result. Clicks and moves take x and y. Drags take a path of x/y points. Keypress takes keys like ['CTRL','Z']. Type takes text. Scroll takes x, y and scroll_x or scroll_y. Wait takes milliseconds. For a polygon, choose the Polygon tool to the right of Rectangle. Drag the first edge only, then click each remaining vertex once and press Enter to close the shape. A single drag around the outline does not add vertices. Choose the bottom fill option before drawing for a solid foreground-color polygon.",
+                "inputSchema": {
+                    "type": "object", "required": ["actions"], "additionalProperties": false,
+                    "properties": {
+                        "actions": {"type": "array", "minItems": 1, "maxItems": 128, "items": {
+                            "type": "object", "required": ["type"], "additionalProperties": false,
+                            "properties": {
+                                "type": {"enum": ["move","click","double_click","drag","scroll","keypress","type","wait"]},
+                                "x": {"type": "integer"}, "y": {"type": "integer"},
+                                "button": {"enum": ["left", "right"]},
+                                "path": {"type": "array", "minItems": 2, "maxItems": 128, "items": {
+                                    "type": "object", "required": ["x", "y"], "additionalProperties": false,
+                                    "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}
+                                }},
+                                "scroll_x": {"type": "integer"}, "scroll_y": {"type": "integer"},
+                                "keys": {"type": "array", "items": {"type": "string"}},
+                                "text": {"type": "string"}, "milliseconds": {"type": "integer"}
+                            }
+                        }},
+                        "narration": {"type": "string", "maxLength": 200, "description": "One short first-person line about what you're doing, including how you're fixing any mistake the screenshot or tool result showed."},
+                        "subject": {"type": "string", "maxLength": 200, "description": "In the first drawing batch, name the specific subject you intend to draw."}
+                    }
                 }
-            }
-        }),
-    ];
-    if narrate {
-        tools.push(json!({
-            "name": "review",
-            "description": "Finish the drawing and narrate one short, scathing sentence about a visible flaw in the final picture.",
-            "inputSchema": {
-                "type": "object", "required": ["narration"], "additionalProperties": false,
-                "properties": {"narration": {"type": "string", "minLength": 1, "maxLength": 200}}
-            }
-        }));
-    }
+            }),
+        ]
+    } else {
+        Vec::new()
+    };
     if reference {
         tools.push(json!({
             "name": "reference",
-            "description": "See the reference image provided for this drawing.",
+            "description": "See the image provided for this task.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "annotations": {"readOnlyHint": true}
         }));

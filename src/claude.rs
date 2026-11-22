@@ -1,4 +1,4 @@
-use crate::harness::{self, Effort, Event, Model, ModelProbe, Process};
+use crate::harness::{self, Effort, Event, Model, ModelProbe, Process, Query};
 use crate::{Result, Run};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -70,24 +70,15 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
             "mcp__paintrs__act",
         ])
         .env("AUTO_PAINT_MCP_TOKEN", token);
-    if run.options.narrate {
-        command.arg("mcp__paintrs__review");
-    }
     spawn(command, prompt, run.reference.as_deref(), drawing_events)
 }
 
-pub fn start_selection(
-    directory: &Path,
-    model: &str,
-    effort: Option<Effort>,
-    schema: &Path,
-    prompt: &str,
-) -> Result<Process> {
-    let mut command = exec_command(directory, model, effort);
+pub fn start_query(query: Query<'_>) -> Result<Process> {
+    let mut command = exec_command(query.directory, query.model, query.effort);
     command
         .arg("--json-schema")
-        .arg(std::fs::read_to_string(schema)?);
-    spawn(command, prompt, None, result_events)
+        .arg(std::fs::read_to_string(query.schema)?);
+    spawn(command, query.prompt, query.image, result_events)
 }
 
 fn exec_command(directory: &Path, model: &str, effort: Option<Effort>) -> Command {

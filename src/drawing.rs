@@ -3,7 +3,7 @@ use crate::mcp::{Action, Batch, Button, Command, Point, Server};
 use crate::narration::Narration;
 use crate::overlay::Overlays;
 use crate::video::Video;
-use crate::{FPS, HEIGHT, Result, Run, WIDTH};
+use crate::{FPS, HEIGHT, Result, Run, WIDTH, evaluation};
 use paintrs::automation::{Modifiers, NamedKey, Session};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +32,7 @@ pub fn run(
     } else {
         drawing.run_harness(&run)
     };
-    let output = drawing.finish(&run);
+    let output = drawing.finish(&run, result.is_ok());
     if let Err(error) = &output {
         eprintln!("Could not finish recording: {error}");
     }
@@ -54,7 +54,7 @@ struct Drawing<'a> {
     deadline: Instant,
     pointer: Point,
     narration: Option<Narration>,
-    review: Option<String>,
+    subject: Option<String>,
     overlays: Option<Overlays>,
     composited: Vec<u32>,
 }
@@ -82,7 +82,7 @@ impl<'a> Drawing<'a> {
             deadline: now + RUN_LIMIT,
             pointer: Point { x: -1, y: -1 },
             narration,
-            review: None,
+            subject: None,
             overlays,
             composited: Vec::new(),
         };
@@ -164,7 +164,7 @@ impl<'a> Drawing<'a> {
             Harness::Agy => run.reference.clone(),
             _ => None,
         };
-        let requests = server.start(run.options.turns, run.options.narrate, reference)?;
+        let requests = server.start(run.options.turns, reference)?;
         let mut process = harness.start(run, address, &token)?;
         let mut usage = None;
         loop {
@@ -212,27 +212,13 @@ impl<'a> Drawing<'a> {
         &mut self,
         command: Command,
         opening: Option<&str>,
-    ) -> std::result::Result<Option<Vec<u8>>, String> {
+    ) -> std::result::Result<Vec<u8>, String> {
         match command {
-            Command::Screenshot => self.session.screenshot().map(Some),
+            Command::Screenshot => self.session.screenshot(),
             Command::Act(batch) => {
-                if self.review.is_some() {
-                    return Err("The drawing is already finished".into());
-                }
                 self.batch(batch, opening)
                     .map_err(|error| error.to_string())?;
-                self.session.screenshot().map(Some)
-            }
-            Command::Review(line) => {
-                if self.start.is_none() {
-                    return Err("Draw something before submitting the review".into());
-                }
-                if self.review.is_some() {
-                    return Err("The final review is already recorded".into());
-                }
-                println!("Final review {line:?}");
-                self.review = Some(line);
-                Ok(None)
+                self.session.screenshot()
             }
         }
     }
@@ -242,6 +228,12 @@ impl<'a> Drawing<'a> {
             return Err("An action batch needs 1 to 128 actions".into());
         }
         let line = if self.start.is_none() {
+            self.subject = batch
+                .subject
+                .as_deref()
+                .map(str::trim)
+                .filter(|subject| !subject.is_empty())
+                .map(|subject| subject.chars().take(200).collect());
             opening.or(batch.narration.as_deref())
         } else {
             batch.narration.as_deref()
@@ -395,12 +387,37 @@ impl<'a> Drawing<'a> {
         )
     }
 
-    fn finish(mut self, run: &Run) -> Result<()> {
-        self.session.finish(&run.output.join("drawing.png"))?;
+    fn finish(mut self, run: &Run, completed: bool) -> Result<()> {
+        let picture = run.output.join("drawing.png");
+        self.session.finish(&picture)?;
         self.session.move_pointer(-1, -1);
         self.render();
+        let review = if completed
+            && self.narration.is_some()
+            && self.start.is_some()
+            && !run.options.smoke_test
+            && !self.cancelled.load(Ordering::Relaxed)
+        {
+            self.sample()?;
+            let paused = Instant::now();
+            let review =
+                evaluation::review(run, self.subject.as_deref(), &picture, &self.cancelled);
+            self.start = self.start.map(|start| start + paused.elapsed());
+            match review {
+                Ok(line) => {
+                    println!("Final review {line:?}");
+                    Some(line)
+                }
+                Err(error) => {
+                    eprintln!("Could not evaluate the drawing: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let start = self.start_recording()?;
-        if let (Some(review), Some(narration)) = (self.review.as_deref(), &mut self.narration)
+        if let (Some(review), Some(narration)) = (review.as_deref(), &mut self.narration)
             && let Some(samples) = narration.add_review(start.elapsed(), review)
             && let Some(preview) = &mut self.preview
         {

@@ -2,9 +2,11 @@ mod agy;
 mod claude;
 mod codex;
 mod drawing;
+mod evaluation;
 mod harness;
 mod mcp;
 mod narration;
+mod opencode;
 mod overlay;
 mod playback;
 mod selection;
@@ -54,7 +56,7 @@ struct Options {
     /// CLI to drive the drawing.
     #[arg(long, value_enum, default_value = "codex")]
     harness: Harness,
-    /// Model name or family (defaults to Terra, Haiku, or Gemini 3.8 Flash).
+    /// Model name or family. Defaults depend on the harness.
     #[arg(long)]
     model: Option<String>,
     /// Reasoning effort for the selected model.

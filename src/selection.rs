@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::harness::{Effort, Harness};
+use crate::harness::{Effort, Harness, Query};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -167,7 +167,17 @@ fn pick(
     limit: usize,
     prompt: &str,
 ) -> Result<Pick> {
-    let (text, usage) = harness.structured_reply(directory, model, effort, schema, prompt)?;
+    let (text, usage) = harness.structured_reply(
+        Query {
+            directory,
+            model,
+            effort,
+            schema,
+            prompt,
+            image: None,
+        },
+        None,
+    )?;
     let suggestions: Suggestions = serde_json::from_str(&text)
         .map_err(|err| format!("Could not read {}'s suggestions: {err}", harness.name()))?;
     let mut seen = HashSet::new();
