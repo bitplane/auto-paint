@@ -2,6 +2,8 @@ mod codex;
 mod drawing;
 mod mcp;
 mod narration;
+mod playback;
+mod selection;
 mod subtitles;
 mod video;
 mod watch;
@@ -37,9 +39,12 @@ struct Options {
     /// Record with no visible window.
     #[arg(long)]
     no_watch: bool,
-    /// Add an offline English voiceover and subtitles to the recording.
-    #[arg(long)]
+    /// Record without voiceover or subtitles.
+    #[arg(long = "no-narrate", action = clap::ArgAction::SetFalse)]
     narrate: bool,
+    // Accept the former opt-in flag for existing scripts.
+    #[arg(long = "narrate", hide = true, conflicts_with = "narrate")]
+    _legacy_narrate: bool,
     /// Maximum number of screenshot and action batches.
     #[arg(long, default_value_t = 45, value_parser = clap::value_parser!(u32).range(1..=1000))]
     turns: u32,
@@ -58,6 +63,7 @@ struct Run {
     output: PathBuf,
     prompt: String,
     reference: Option<PathBuf>,
+    intro: Option<String>,
 }
 
 impl Run {
@@ -96,16 +102,33 @@ impl Run {
             }
             None => unique_output(&root)?,
         };
-        let prompt = options
-            .prompt
-            .clone()
-            .unwrap_or_else(|| default_prompt(options.output.as_deref(), reference.as_deref()));
         println!("Output: {}", output.display());
+        let (prompt, intro) = if !options.smoke_test
+            && options.prompt.is_none()
+            && options.output.is_none()
+            && reference.is_none()
+        {
+            let (category, subject) = selection::choose(&output, &options.model)?;
+            let intro = options
+                .narrate
+                .then(|| format!("I landed on {category} and picked {subject}."));
+            (
+                format!("Draw {subject}. Use bold shapes and a clear composition."),
+                intro,
+            )
+        } else {
+            let prompt = options
+                .prompt
+                .clone()
+                .unwrap_or_else(|| default_prompt(options.output.as_deref(), reference.as_deref()));
+            (prompt, None)
+        };
         Ok(Self {
             options,
             output,
             prompt,
             reference,
+            intro,
         })
     }
 }
@@ -161,7 +184,7 @@ fn run() -> Result<()> {
     }
     let run = Run::new(options)?;
     if run.options.no_watch {
-        drawing::run(run, Arc::new(AtomicBool::new(false)), |_| {})
+        drawing::run(run, Arc::new(AtomicBool::new(false)), None)
     } else {
         watch::run(run)
     }

@@ -38,6 +38,8 @@ jobs:
       - name: Install video and window test tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg xvfb xauth libxkbcommon-x11-0
-      - name: Watch a drawing and decode the MP4
+      - name: Verify narrated and silent recordings
         if: runner.os == 'Linux'
-        run: xvfb-run -a python scripts/smoke.py ${{ matrix.binary }} --watch --narrate --ffprobe
+        run: |
+          python scripts/smoke.py ${{ matrix.binary }} --watch --ffprobe
+          python scripts/smoke.py ${{ matrix.binary }} --no-narrate --ffprobe

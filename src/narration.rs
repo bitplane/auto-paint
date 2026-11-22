@@ -32,10 +32,10 @@ impl Narration {
         })
     }
 
-    pub fn add(&mut self, at: Duration, text: &str) {
+    pub fn add(&mut self, at: Duration, text: &str) -> Option<&[i16]> {
         let offset = (at.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize;
         if offset < self.samples.len() || self.cues.len() == 128 {
-            return;
+            return None;
         }
         let text: String = text
             .split_whitespace()
@@ -45,11 +45,11 @@ impl Narration {
             .take(200)
             .collect();
         if text.is_empty() {
-            return;
+            return None;
         }
         let voice = self.engine.synthesize(&text);
         if voice.samples.is_empty() {
-            return;
+            return None;
         }
         self.samples.resize(offset, 0);
         self.samples.extend(voice.samples);
@@ -58,6 +58,7 @@ impl Narration {
             end: self.samples.len() as u64,
             text,
         });
+        Some(&self.samples[offset..])
     }
 
     pub fn subtitle_at(&self, frame: u64) -> Option<&str> {

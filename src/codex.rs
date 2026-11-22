@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn check_login() -> Result<()> {
     let output = command()
@@ -91,26 +92,9 @@ impl Process {
             .to_str()
             .ok_or("Auto Paint's executable path must be UTF-8")?;
         let server = "mcp_servers.paintrs";
-        let mut command = command();
+        let mut command = exec_command(&run.output, &run.options.model);
         command
             .args([
-                "-a",
-                "never",
-                "exec",
-                "--json",
-                "--sandbox",
-                "read-only",
-                "--disable",
-                "shell_tool",
-                "--ignore-user-config",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--color",
-                "never",
-                "-m",
-                &run.options.model,
-                "-c",
-                "model_reasoning_effort=\"low\"",
                 "-c",
                 &format!("{server}.command={}", toml_string(executable)),
                 "-c",
@@ -125,15 +109,15 @@ impl Process {
                 "-c",
                 &format!("{server}.tools.act.approval_mode=\"approve\""),
             ])
-            .env("AUTO_PAINT_MCP_TOKEN", token)
-            .current_dir(&run.output)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
+            .env("AUTO_PAINT_MCP_TOKEN", token);
         if let Some(path) = &run.reference {
             command.arg("--image").arg(path);
         }
-        command.args(["--", "-"]);
+        Self::spawn(command, &instructions(run))
+    }
 
+    fn spawn(mut command: Command, prompt: &str) -> Result<Self> {
+        command.args(["--", "-"]);
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         let (send, events) = mpsc::channel();
@@ -155,7 +139,7 @@ impl Process {
             reader: Some(reader),
         };
         let mut stdin = process.child.stdin.take().expect("piped stdin");
-        stdin.write_all(instructions(run).as_bytes())?;
+        stdin.write_all(prompt.as_bytes())?;
         Ok(process)
     }
 
@@ -177,6 +161,75 @@ impl Drop for Process {
     }
 }
 
+fn exec_command(directory: &Path, model: &str) -> Command {
+    let mut command = command();
+    command
+        .args([
+            "-a",
+            "never",
+            "exec",
+            "--json",
+            "--sandbox",
+            "read-only",
+            "--disable",
+            "shell_tool",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color",
+            "never",
+            "-m",
+            model,
+            "-c",
+            "model_reasoning_effort=\"low\"",
+        ])
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    command
+}
+
+pub fn structured_reply(
+    directory: &Path,
+    model: &str,
+    schema: &Path,
+    prompt: &str,
+) -> Result<(String, Option<Value>)> {
+    let mut command = exec_command(directory, model);
+    command.arg("--output-schema").arg(schema);
+    let mut process = Process::spawn(command, prompt)?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut message = None;
+    let mut usage = None;
+    let mut error = None;
+    loop {
+        let status = process.status()?;
+        for event in process.events.try_iter() {
+            match event {
+                Event::Message(text) => message = Some(text),
+                Event::Usage(value) => usage = Some(value),
+                Event::Error(text) => error = Some(text),
+                Event::Tool { .. } => {}
+            }
+        }
+        if let Some(status) = status {
+            if !status.success() {
+                return Err(error
+                    .unwrap_or_else(|| format!("Codex exited with {status}"))
+                    .into());
+            }
+            return Ok((
+                message.ok_or("Codex returned no subject suggestions")?,
+                usage,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err("Timed out waiting for Codex to suggest subjects".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn toml_string(value: &str) -> String {
     // JSON's spaces, slashes and escaped quotes are also accepted in TOML basic strings.
     json!(value).to_string()
@@ -184,14 +237,21 @@ fn toml_string(value: &str) -> String {
 
 fn instructions(run: &Run) -> String {
     let narration = if run.options.narrate {
-        " At each major drawing step, include an optional one-sentence narration in the act call describing what the viewer is about to see."
+        " At major drawing steps, use the act call's narration field for one short first-person line \
+         about what you're doing in Paintrs. Use the latest screenshot. When a screenshot or tool result \
+         shows a mistake, say what you got wrong and how you're fixing it. Skip routine clicks."
+    } else {
+        ""
+    };
+    let selection_narration = if run.intro.is_some() {
+        " The recording announces the random choice in the first action batch. Narrate the major steps that follow."
     } else {
         ""
     };
     format!(
         "Draw a picture using only the Paintrs screenshot and act tools. Start with a screenshot. \
          Click and drag in the actual editor to create the image. Treat screenshots as window-local coordinates. \
-         Leave the finished picture visible. The app saves it automatically when you finish.{narration}\n\n\
+         Leave the finished picture visible. The app saves it automatically when you finish.{narration}{selection_narration}\n\n\
          Drawing request: {}\n",
         run.prompt,
     )

@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 
@@ -19,18 +21,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--watch", action="store_true")
-    parser.add_argument("--narrate", action="store_true")
+    parser.add_argument("--no-narrate", action="store_true")
     parser.add_argument("--ffprobe", action="store_true")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="auto-paint-smoke-") as folder:
         output = Path(folder) / "take"
         command = [str(args.binary.resolve()), "--smoke-test", "--output", str(output)]
-        if args.narrate:
-            command.append("--narrate")
+        if args.no_narrate:
+            command.append("--no-narrate")
         if not args.watch:
             command.append("--no-watch")
-        subprocess.run(command, check=True, timeout=90)
+        env = os.environ.copy()
+        if args.watch and sys.platform.startswith("linux"):
+            env.pop("WAYLAND_DISPLAY", None)
+            env.pop("WAYLAND_SOCKET", None)
+            command = ["xvfb-run", "-a", *command]
+        subprocess.run(command, env=env, check=True, timeout=90)
         png = output / "drawing.png"
         with png.open("rb") as drawing:
             assert drawing.read(8) == b"\x89PNG\r\n\x1a\n", "Invalid drawing PNG"
@@ -42,11 +49,11 @@ def main():
                 ["ffprobe", "-v", "error", "-show_streams", "-of", "json", video],
                 text=True,
             ))["streams"]
-            expected = {"h264", "aac"} if args.narrate else {"h264"}
+            expected = {"h264", "aac"} if not args.no_narrate else {"h264"}
             assert {stream["codec_name"] for stream in streams} == expected
             picture = next(stream for stream in streams if stream["codec_name"] == "h264")
             assert (picture["width"], picture["height"]) == (1000, 700)
-            if args.narrate:
+            if not args.no_narrate:
                 before = subtitle_region(video, ["-ss", "0"])
                 speaking = subtitle_region(video, ["-ss", "1"])
                 finished = subtitle_region(video, ["-sseof", "-0.25"])

@@ -14,6 +14,7 @@ clap = { version = "4.6", features = ["derive"] }
 flite-rs = { version = "0.2", default-features = false, features = ["kal16"] }
 fontdue = "0.9.3"
 getrandom = "0.4"
+maudio = "0.1.15"
 muxide = { version = "0.5", default-features = false }
 openh264 = "0.9.10"
 paintrs = "0.1.2"

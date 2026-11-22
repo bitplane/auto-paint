@@ -250,7 +250,7 @@ fn tools() -> Value {
                             "text": {"type": "string"}, "milliseconds": {"type": "integer"}
                         }
                     }},
-                    "narration": {"type": "string", "maxLength": 200, "description": "One optional short viewer-facing sentence about the drawing step."}
+                    "narration": {"type": "string", "maxLength": 200, "description": "One short first-person line about what you're doing, including how you're fixing any mistake the screenshot or tool result showed."}
                 }
             }
         }

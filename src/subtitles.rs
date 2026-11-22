@@ -13,7 +13,7 @@ const OUTLINE_RADIUS: i32 = 2;
 
 pub struct Subtitles {
     font: Font,
-    current: Option<String>,
+    current: String,
     layout: Layout,
     text: Vec<u8>,
     outline: Vec<u8>,
@@ -27,46 +27,33 @@ impl Subtitles {
         )?;
         Ok(Self {
             font,
-            current: None,
+            current: String::new(),
             layout: Layout::new(CoordinateSystem::PositiveYDown),
             text: vec![0; REGION_PIXELS],
             outline: vec![0; REGION_PIXELS],
         })
     }
 
-    pub fn update(&mut self, text: Option<&str>) -> bool {
-        if text == self.current.as_deref() {
-            return false;
-        }
-        self.current = text.map(str::to_owned);
-        if let Some(text) = text {
+    pub fn draw(&mut self, text: &str, pixels: &mut [u32]) {
+        if text != self.current {
             self.rasterize(text);
+            self.current.clear();
+            self.current.push_str(text);
         }
-        true
-    }
-
-    pub fn blend(&self, rgb: &mut [u8]) {
-        if self.current.is_none() {
-            return;
-        }
-        let start = REGION_TOP * WIDTH as usize * 3;
-        let region = &mut rgb[start..start + REGION_PIXELS * 3];
-        for ((pixel, &fill), &outline) in region
-            .as_chunks_mut::<3>()
-            .0
-            .iter_mut()
-            .zip(&self.text)
-            .zip(&self.outline)
-        {
+        let start = REGION_TOP * WIDTH as usize;
+        let region = &mut pixels[start..start + REGION_PIXELS];
+        for ((pixel, &fill), &outline) in region.iter_mut().zip(&self.text).zip(&self.outline) {
             if outline == 0 {
                 continue;
             }
             let fill = u16::from(fill);
             let outline = u16::from(outline);
-            for channel in pixel {
-                let shaded = u16::from(*channel) * (255 - outline) / 255;
-                *channel = (fill + shaded * (255 - fill) / 255) as u8;
-            }
+            let [alpha, r, g, b] = pixel.to_be_bytes();
+            let [r, g, b] = [r, g, b].map(|channel| {
+                let shaded = u16::from(channel) * (255 - outline) / 255;
+                (fill + shaded * (255 - fill) / 255) as u8
+            });
+            *pixel = u32::from_be_bytes([alpha, r, g, b]);
         }
     }
 

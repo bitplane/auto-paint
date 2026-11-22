@@ -1,4 +1,6 @@
-use crate::{HEIGHT, Result, Run, WIDTH, drawing};
+use crate::drawing::{self, Preview as Update};
+use crate::playback::Playback;
+use crate::{HEIGHT, Result, Run, WIDTH};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,14 +156,33 @@ pub fn run(run: Run) -> Result<()> {
         let frames = frames.clone();
         let cancelled = cancelled.clone();
         thread::spawn(move || {
-            let result = drawing::run(run, cancelled, |pixels| {
-                let mut frames = frames.lock().expect("frame lock");
-                frames.latest = Some(Arc::from(pixels));
-                if !frames.pending {
-                    frames.pending = true;
-                    let _ = proxy.send_event(Event::Frame);
+            let playback = if run.options.narrate {
+                match Playback::open() {
+                    Ok(playback) => Some(playback),
+                    Err(error) => {
+                        eprintln!("Live audio unavailable: {error}");
+                        None
+                    }
                 }
-            });
+            } else {
+                None
+            };
+            let mut update = |update: Update<'_>| match update {
+                Update::Frame(pixels) => {
+                    let mut frames = frames.lock().expect("frame lock");
+                    frames.latest = Some(Arc::from(pixels));
+                    if !frames.pending {
+                        frames.pending = true;
+                        let _ = proxy.send_event(Event::Frame);
+                    }
+                }
+                Update::Speech(samples) => {
+                    if let Some(playback) = &playback {
+                        playback.play(samples);
+                    }
+                }
+            };
+            let result = drawing::run(run, cancelled, Some(&mut update));
             let _ = proxy.send_event(Event::Done);
             result
         })

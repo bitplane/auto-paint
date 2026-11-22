@@ -1,5 +1,4 @@
 use crate::narration::{Narration, SAMPLE_RATE};
-use crate::subtitles::Subtitles;
 use crate::{FPS, HEIGHT, Result, WIDTH};
 use muxide::api::{AacProfile, AudioCodec, Muxer, MuxerBuilder, VideoCodec};
 use openh264::encoder::{
@@ -18,7 +17,6 @@ pub struct Video {
     rgb: Vec<u8>,
     yuv: YUVBuffer,
     packet: Vec<u8>,
-    subtitles: Option<Subtitles>,
 }
 
 impl Video {
@@ -30,7 +28,6 @@ impl Video {
             .intra_frame_period(IntraFramePeriod::from_num_frames(2 * FPS))
             .skip_frames(false);
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)?;
-        let subtitles = narrate.then(Subtitles::new).transpose()?;
         let file = BufWriter::new(File::create(path)?);
         let mut builder = MuxerBuilder::new(file)
             .video(VideoCodec::H264, WIDTH, HEIGHT, f64::from(FPS))
@@ -46,24 +43,17 @@ impl Video {
             rgb: vec![0; size * 3],
             yuv: YUVBuffer::new(WIDTH as usize, HEIGHT as usize),
             packet: Vec::new(),
-            subtitles,
         })
     }
 
-    pub fn write(&mut self, pixels: &[u32], frame: u64, subtitle: Option<&str>) -> Result<()> {
-        let subtitle_changed = self
-            .subtitles
-            .as_mut()
-            .is_some_and(|subtitles| subtitles.update(subtitle));
-        if self.pixels != pixels || subtitle_changed {
+    pub fn write(&mut self, pixels: &[u32], frame: u64) -> Result<bool> {
+        let changed = self.pixels != pixels;
+        if changed {
             self.pixels.clear();
             self.pixels.extend_from_slice(pixels);
             for (rgb, &pixel) in self.rgb.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
                 let [_, r, g, b] = pixel.to_be_bytes();
                 *rgb = [r, g, b];
-            }
-            if let Some(subtitles) = &self.subtitles {
-                subtitles.blend(&mut self.rgb);
             }
             self.yuv.read_rgb8(RgbSliceU8::new(
                 &self.rgb,
@@ -80,7 +70,7 @@ impl Video {
         }
         self.mux
             .write_video(frame as f64 / f64::from(FPS), &self.packet, keyframe)?;
-        Ok(())
+        Ok(changed)
     }
 
     pub fn finish(mut self, narration: Option<Narration>) -> Result<()> {

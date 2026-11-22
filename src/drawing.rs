@@ -1,6 +1,7 @@
 use crate::codex::{self, Event, Process};
 use crate::mcp::{Action, Batch, Button, Point, Server};
 use crate::narration::Narration;
+use crate::subtitles::Subtitles;
 use crate::video::Video;
 use crate::{FPS, HEIGHT, Result, Run, WIDTH};
 use paintrs::automation::{Modifiers, NamedKey, Session};
@@ -15,8 +16,17 @@ const RUN_LIMIT: Duration = Duration::from_secs(900);
 const BATCH_LIMIT: Duration = Duration::from_secs(40);
 const CLICK_HOLD: Duration = Duration::from_millis(35);
 
-pub fn run(run: Run, cancelled: Arc<AtomicBool>, preview: impl FnMut(&[u32])) -> Result<()> {
-    let mut drawing = Drawing::new(&run, &cancelled, preview)?;
+pub enum Preview<'a> {
+    Frame(&'a [u32]),
+    Speech(&'a [i16]),
+}
+
+pub fn run(
+    run: Run,
+    cancelled: Arc<AtomicBool>,
+    preview: Option<&mut dyn FnMut(Preview<'_>)>,
+) -> Result<()> {
+    let mut drawing = Drawing::new(&run, cancelled, preview)?;
     let result = if run.options.smoke_test {
         drawing.smoke_test()
     } else {
@@ -34,42 +44,65 @@ pub fn run(run: Run, cancelled: Arc<AtomicBool>, preview: impl FnMut(&[u32])) ->
     Ok(())
 }
 
-struct Drawing<'a, P> {
+struct Drawing<'a> {
     session: Session,
     video: Video,
-    preview: P,
-    cancelled: &'a AtomicBool,
-    start: Instant,
+    preview: Option<&'a mut dyn FnMut(Preview<'_>)>,
+    cancelled: Arc<AtomicBool>,
+    start: Option<Instant>,
     last_frame: Option<u64>,
     deadline: Instant,
     pointer: Point,
     narration: Option<Narration>,
+    subtitles: Option<Subtitles>,
+    captioned: Vec<u32>,
 }
 
-impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
-    fn new(run: &Run, cancelled: &'a AtomicBool, preview: P) -> Result<Self> {
+impl<'a> Drawing<'a> {
+    fn new(
+        run: &Run,
+        cancelled: Arc<AtomicBool>,
+        preview: Option<&'a mut dyn FnMut(Preview<'_>)>,
+    ) -> Result<Self> {
         let video = Video::new(&run.output.join(".drawing.mp4"), run.options.narrate)?;
         let session = Session::new(WIDTH, HEIGHT)?;
         let narration = run.options.narrate.then(Narration::new).transpose()?;
+        let subtitles = run.options.narrate.then(Subtitles::new).transpose()?;
         let now = Instant::now();
         let mut drawing = Self {
             session,
             video,
             preview,
             cancelled,
-            start: now,
+            start: None,
             last_frame: None,
             deadline: now + RUN_LIMIT,
             pointer: Point { x: -1, y: -1 },
             narration,
+            subtitles,
+            captioned: Vec::new(),
         };
         drawing.render();
-        drawing.sample()?;
         Ok(drawing)
     }
 
     fn render(&mut self) {
-        (self.preview)(self.session.render());
+        let pixels = self.session.render();
+        if self.start.is_none()
+            && let Some(preview) = &mut self.preview
+        {
+            preview(Preview::Frame(pixels));
+        }
+    }
+
+    fn start_recording(&mut self) -> Result<Instant> {
+        if let Some(start) = self.start {
+            return Ok(start);
+        }
+        let start = Instant::now();
+        self.start = Some(start);
+        self.sample()?;
+        Ok(start)
     }
 
     fn sample(&mut self) -> Result<()> {
@@ -77,10 +110,13 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
         if self.session.animate(now) {
             self.render();
         }
+        let Some(start) = self.start else {
+            return Ok(());
+        };
         let frame = if self.last_frame.is_none() {
             0
         } else {
-            (now.duration_since(self.start).as_nanos() * u128::from(FPS) / 1_000_000_000) as u64
+            (now.duration_since(start).as_nanos() * u128::from(FPS) / 1_000_000_000) as u64
         };
         if self.last_frame.is_none_or(|last| frame > last) {
             self.write_frame(frame)?;
@@ -123,7 +159,9 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
             self.sample()?;
             match requests.recv_timeout(Duration::from_millis(12)) {
                 Ok(request) => {
-                    let result = request.batch.map_or(Ok(()), |batch| self.batch(batch));
+                    let result = request
+                        .batch
+                        .map_or(Ok(()), |batch| self.batch(batch, run.intro.as_deref()));
                     let result = result
                         .map_err(|err| err.to_string())
                         .and_then(|()| self.session.screenshot());
@@ -155,11 +193,17 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
         }
     }
 
-    fn batch(&mut self, batch: Batch) -> Result<()> {
+    fn batch(&mut self, batch: Batch, intro: Option<&str>) -> Result<()> {
         if !(1..=128).contains(&batch.actions.len()) {
             return Err("An action batch needs 1 to 128 actions".into());
         }
-        if let Some(line) = batch.narration.as_deref() {
+        let line = if self.start.is_none() {
+            intro.or(batch.narration.as_deref())
+        } else {
+            batch.narration.as_deref()
+        };
+        self.start_recording()?;
+        if let Some(line) = line {
             self.cue(line);
         }
         let deadline = self.deadline;
@@ -173,8 +217,11 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
     }
 
     fn cue(&mut self, line: &str) {
-        if let Some(narration) = &mut self.narration {
-            narration.add(self.start.elapsed(), line);
+        if let (Some(start), Some(narration)) = (self.start, &mut self.narration)
+            && let Some(samples) = narration.add(start.elapsed(), line)
+            && let Some(preview) = &mut self.preview
+        {
+            preview(Preview::Speech(samples));
         }
     }
 
@@ -183,7 +230,19 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
             .narration
             .as_ref()
             .and_then(|voice| voice.subtitle_at(frame));
-        self.video.write(self.session.pixels(), frame, subtitle)
+        let mut pixels = self.session.pixels();
+        if let (Some(subtitles), Some(text)) = (&mut self.subtitles, subtitle) {
+            self.captioned.clear();
+            self.captioned.extend_from_slice(pixels);
+            subtitles.draw(text, &mut self.captioned);
+            pixels = &self.captioned;
+        }
+        if self.video.write(pixels, frame)?
+            && let Some(preview) = &mut self.preview
+        {
+            preview(Preview::Frame(pixels));
+        }
+        Ok(())
     }
 
     fn act(&mut self, action: Action) -> Result<()> {
@@ -283,6 +342,7 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
     }
 
     fn smoke_test(&mut self) -> Result<()> {
+        self.start_recording()?;
         self.cue("I am drawing a line in Paintrs.");
         self.click(Point { x: 22, y: 151 }, Button::Left)?;
         self.drag(
@@ -301,8 +361,21 @@ impl<'a, P: FnMut(&[u32])> Drawing<'a, P> {
         self.session.finish(&run.output.join("drawing.png"))?;
         self.session.move_pointer(-1, -1);
         self.render();
-        let video_duration = self.start.elapsed().as_secs_f64();
+        let start = self.start_recording()?;
         let audio_duration = self.narration.as_ref().map_or(0.0, Narration::duration);
+        if self.preview.is_some() && audio_duration > 0.0 {
+            // Keep the window and output device alive while the final cue plays out.
+            let stop = start + Duration::from_secs_f64(audio_duration) + FRAME_INTERVAL * 2;
+            loop {
+                let remaining = stop.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || self.cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.sample()?;
+                thread::sleep(remaining.min(FRAME_INTERVAL));
+            }
+        }
+        let video_duration = start.elapsed().as_secs_f64();
         let mut frame = self.last_frame.unwrap_or(0) + 1;
         let tail =
             (video_duration.max(audio_duration) * f64::from(FPS)).ceil() as u64 + u64::from(FPS);
