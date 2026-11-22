@@ -1,4 +1,4 @@
-use crate::harness::Event;
+use crate::harness::{Event, Harness};
 use crate::mcp::{Action, Batch, Button, Command, Point, Server};
 use crate::narration::Narration;
 use crate::overlay::Overlays;
@@ -159,8 +159,12 @@ impl<'a> Drawing<'a> {
     fn run_harness(&mut self, run: &Run) -> Result<()> {
         let server = Server::bind()?;
         let (address, token) = (server.address, server.token.clone());
-        let requests = server.start(run.options.turns, run.options.narrate)?;
         let harness = run.options.harness;
+        let reference = match harness {
+            Harness::Agy => run.reference.clone(),
+            _ => None,
+        };
+        let requests = server.start(run.options.turns, run.options.narrate, reference)?;
         let mut process = harness.start(run, address, &token)?;
         let mut usage = None;
         loop {

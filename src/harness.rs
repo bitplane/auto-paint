@@ -1,4 +1,4 @@
-use crate::{Result, Run, claude, codex};
+use crate::{Result, Run, agy, claude, codex};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -13,6 +13,28 @@ use std::time::{Duration, Instant};
 pub enum Harness {
     Codex,
     Claude,
+    Agy,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 impl Harness {
@@ -20,21 +42,29 @@ impl Harness {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Agy => "agy",
         }
     }
 
-    pub fn resolve_model(self, directory: &Path, requested: Option<&str>) -> String {
-        let (family, fallback) = match self {
-            Self::Codex => ("terra", "gpt-6.1-terra"),
-            Self::Claude => ("haiku", "haiku"),
+    pub fn resolve_model(
+        self,
+        directory: &Path,
+        requested: Option<&str>,
+        effort: Option<Effort>,
+    ) -> Result<String> {
+        let (family, fallback, models) = match self {
+            Self::Codex => ("terra", "gpt-6.1-terra", codex::models(directory)),
+            Self::Claude => ("haiku", "haiku", claude::models(directory)),
+            Self::Agy => {
+                let models = agy::models(directory)?;
+                let model = select_agy_model(&models, requested, effort)?;
+                println!("Model: {} (agy)", model.id);
+                return Ok(model.id.clone());
+            }
         };
         let query = requested.unwrap_or(family);
-        let models = match self {
-            Self::Codex => codex::models(directory),
-            Self::Claude => claude::models(directory),
-        };
         let matched = match models {
-            Ok(models) => match_model(&models, query).map(|model| model.id.clone()),
+            Ok(models) => match_model(models.iter(), query).map(|model| model.id.clone()),
             Err(error) => {
                 eprintln!("Could not list {} models: {error}", self.name());
                 None
@@ -42,13 +72,14 @@ impl Harness {
         };
         let selected = matched.unwrap_or_else(|| requested.unwrap_or(fallback).to_owned());
         println!("Model: {selected} ({})", self.name());
-        selected
+        Ok(selected)
     }
 
     pub fn check_login(self) -> Result<()> {
         match self {
             Self::Codex => codex::check_login(),
             Self::Claude => claude::check_login(),
+            Self::Agy => Ok(()),
         }
     }
 
@@ -57,6 +88,7 @@ impl Harness {
         match self {
             Self::Codex => codex::start(run, address, token, &prompt),
             Self::Claude => claude::start(run, address, token, &prompt),
+            Self::Agy => agy::start(run, address, token, &prompt),
         }
     }
 
@@ -64,12 +96,14 @@ impl Harness {
         self,
         directory: &Path,
         model: &str,
+        effort: Option<Effort>,
         schema: &Path,
         prompt: &str,
     ) -> Result<(String, Option<Value>)> {
         let mut process = match self {
-            Self::Codex => codex::start_selection(directory, model, schema, prompt),
-            Self::Claude => claude::start_selection(directory, model, schema, prompt),
+            Self::Codex => codex::start_selection(directory, model, effort, schema, prompt),
+            Self::Claude => claude::start_selection(directory, model, effort, schema, prompt),
+            Self::Agy => agy::start_selection(directory, model, effort, schema, prompt),
         }?;
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut message = None;
@@ -117,26 +151,97 @@ pub struct Model {
     pub display_name: String,
 }
 
-fn match_model<'a>(models: &'a [Model], query: &str) -> Option<&'a Model> {
+fn match_model<'a>(
+    models: impl DoubleEndedIterator<Item = &'a Model> + Clone,
+    query: &str,
+) -> Option<&'a Model> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
         return None;
     }
     models
-        .iter()
+        .clone()
         .find(|model| model.id.eq_ignore_ascii_case(&query))
         .or_else(|| {
+            let query = search_text(&query);
+            if query.is_empty() {
+                return None;
+            }
             models
-                .iter()
                 .rev()
                 .filter(|model| {
-                    model.id.to_ascii_lowercase().contains(&query)
-                        || model.display_name.to_ascii_lowercase().contains(&query)
+                    search_text(&model.id).contains(&query)
+                        || search_text(&model.display_name).contains(&query)
                 })
                 .max_by_key(|model| {
                     version_numbers(&model.id).or_else(|| version_numbers(&model.display_name))
                 })
         })
+}
+
+fn search_text(text: &str) -> String {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn select_agy_model<'a>(
+    models: &'a [Model],
+    requested: Option<&str>,
+    effort: Option<Effort>,
+) -> Result<&'a Model> {
+    let eligible = models.iter().filter(|model| {
+        effort.is_none_or(|effort| {
+            let (_, suffix) = split_model_effort(&model.id);
+            suffix.is_none_or(|suffix| suffix == effort.as_str())
+        })
+    });
+    let choice = match requested {
+        Some(query) => {
+            let normalized = search_text(query);
+            let (family, suffix) = split_model_effort(&normalized);
+            let query = if effort.is_some() && suffix.is_some() {
+                family
+            } else {
+                query
+            };
+            match_model(eligible, query)
+        }
+        None => match_model(eligible.clone(), "gemini-3.8-flash-medium")
+            .or_else(|| match_model(eligible.clone(), "gemini-3.8-flash"))
+            .or_else(|| {
+                eligible
+                    .rev()
+                    .filter(|model| {
+                        model.id.starts_with("gemini-")
+                            && model.id.split('-').any(|word| word == "flash")
+                    })
+                    .max_by_key(|model| version_numbers(&model.id))
+            }),
+    };
+    choice.ok_or_else(|| {
+        let names: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
+        let query = requested.unwrap_or("Gemini Flash");
+        let effort = effort.map_or_else(String::new, |effort| {
+            format!(" with {} effort", effort.as_str())
+        });
+        format!(
+            "No Antigravity model matching {query:?} is available{effort}. Choose --model from: {}",
+            names.join(", ")
+        )
+        .into()
+    })
+}
+
+fn split_model_effort(model: &str) -> (&str, Option<&str>) {
+    if let Some((family, suffix)) = model.rsplit_once(['-', ' '])
+        && Effort::from_str(suffix, false).is_ok()
+    {
+        return (family, Some(suffix));
+    }
+    (model, None)
 }
 
 fn version_numbers(name: &str) -> Option<Vec<u64>> {
@@ -209,6 +314,7 @@ pub struct Process<E = Event> {
     child: Child,
     pub events: Receiver<E>,
     reader: Option<thread::JoinHandle<()>>,
+    agy_config: Option<agy::WorkspaceConfig>,
 }
 
 impl<E: Send + 'static> Process<E> {
@@ -219,7 +325,16 @@ impl<E: Send + 'static> Process<E> {
         Ok(process)
     }
 
-    fn open(mut command: Command, decode: fn(&Value) -> Vec<E>) -> Result<Self> {
+    fn open(command: Command, decode: fn(&Value) -> Vec<E>) -> Result<Self> {
+        Self::open_lines(command, move |line| {
+            serde_json::from_str(line).map_or_else(|_| Vec::new(), |value| decode(&value))
+        })
+    }
+
+    pub fn open_lines(
+        mut command: Command,
+        decode: impl Fn(&str) -> Vec<E> + Send + 'static,
+    ) -> Result<Self> {
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
@@ -229,11 +344,9 @@ impl<E: Send + 'static> Process<E> {
                 .lines()
                 .map_while(std::result::Result::ok)
             {
-                if let Ok(value) = serde_json::from_str(&line) {
-                    for event in decode(&value) {
-                        if send.send(event).is_err() {
-                            return;
-                        }
+                for event in decode(&line) {
+                    if send.send(event).is_err() {
+                        return;
                     }
                 }
             }
@@ -242,6 +355,7 @@ impl<E: Send + 'static> Process<E> {
             child,
             events,
             reader: Some(reader),
+            agy_config: None,
         })
     }
 
@@ -253,6 +367,13 @@ impl<E: Send + 'static> Process<E> {
             let _ = reader.join();
         }
         Ok(status)
+    }
+}
+
+impl Process {
+    pub fn with_agy_config(mut self, config: agy::WorkspaceConfig) -> Self {
+        self.agy_config = Some(config);
+        self
     }
 }
 
@@ -285,7 +406,7 @@ fn instructions(run: &Run) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Model, match_model};
+    use super::{Effort, Model, match_model, select_agy_model};
 
     #[test]
     fn matches_exact_ids_and_compares_family_versions_numerically() {
@@ -300,11 +421,43 @@ mod tests {
             id: id.to_owned(),
             display_name: display_name.to_owned(),
         });
-        let matches = |query| match_model(&models, query).map(|model| model.id.as_str());
+        let matches = |query| match_model(models.iter(), query).map(|model| model.id.as_str());
         assert_eq!(matches("sol"), Some("gpt-6.10-sol"));
         assert_eq!(matches("gpt-6.2-sol"), Some("gpt-6.2-sol"));
         assert_eq!(matches("terra"), Some("gpt-7-terra"));
         assert_eq!(matches("Haiku 5"), Some("haiku"));
         assert_eq!(matches("missing"), None);
+    }
+
+    #[test]
+    fn agy_chooses_only_from_the_account_catalogue() {
+        let models = [
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-low",
+            "gemini-3.7-flash-medium",
+            "claude-sonnet-4-6",
+        ]
+        .map(|id| Model {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+        });
+        let select =
+            |account: &[Model], query| select_agy_model(account, query, None).unwrap().id.clone();
+        assert_eq!(select(&models, None), "gemini-3.8-flash-medium");
+        assert_eq!(select(&models, Some("flash")), "gemini-3.8-flash-high");
+        assert_eq!(
+            select(&models, Some("Gemini 3.8 Flash Medium")),
+            "gemini-3.8-flash-medium"
+        );
+        assert_eq!(select(&models[3..], None), "gemini-3.7-flash-medium");
+        assert!(select_agy_model(&models[3..], Some("gemini-3.8-flash-medium"), None).is_err());
+        assert_eq!(
+            select_agy_model(&models, Some("Gemini 3.8 Flash (High)"), Some(Effort::Low))
+                .unwrap()
+                .id,
+            "gemini-3.8-flash-low"
+        );
+        assert!(select_agy_model(&models, Some("flash"), Some(Effort::Max)).is_err());
     }
 }

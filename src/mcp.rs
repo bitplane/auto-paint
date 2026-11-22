@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
@@ -109,7 +110,12 @@ impl Server {
         })
     }
 
-    pub fn start(self, turns: u32, narrate: bool) -> Result<Receiver<Request>> {
+    pub fn start(
+        self,
+        turns: u32,
+        narrate: bool,
+        reference: Option<PathBuf>,
+    ) -> Result<Receiver<Request>> {
         self.listener.set_nonblocking(true)?;
         let (send, receive) = mpsc::sync_channel(1);
         thread::spawn(move || {
@@ -117,7 +123,9 @@ impl Server {
             for _ in 0..600 {
                 match self.listener.accept() {
                     Ok((connection, _)) => {
-                        if let Err(error) = self.serve(connection, &send, turns, narrate) {
+                        if let Err(error) =
+                            self.serve(connection, &send, turns, narrate, reference.as_deref())
+                        {
                             eprintln!("Paintrs MCP: {error}");
                         }
                         break;
@@ -141,6 +149,7 @@ impl Server {
         send: &SyncSender<Request>,
         turns: u32,
         narrate: bool,
+        reference: Option<&Path>,
     ) -> Result<()> {
         connection.set_nonblocking(false)?;
         connection.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -171,21 +180,20 @@ impl Server {
                     "serverInfo": {"name": "paintrs", "version": env!("CARGO_PKG_VERSION")}
                 }),
                 Some("ping") => json!({}),
-                Some("tools/list") => json!({"tools": tools(narrate)}),
-                Some("tools/call") => {
-                    let result = call(send, params, &mut remaining, narrate);
-                    match result {
-                        Ok(Some(image)) => json!({"content": [{
-                            "type": "image", "data": STANDARD.encode(image), "mimeType": "image/png"
-                        }]}),
+                Some("tools/list") => json!({"tools": tools(narrate, reference.is_some())}),
+                Some("tools/call") => match (params["name"].as_str(), reference) {
+                    (Some("reference"), Some(path)) => match reference_image(path) {
+                        Ok(image) => image,
+                        Err(error) => tool_error(&error.to_string()),
+                    },
+                    _ => match call(send, params, &mut remaining, narrate) {
+                        Ok(Some(image)) => image_response(&image, "image/png"),
                         Ok(None) => {
                             json!({"content": [{"type": "text", "text": "Final review recorded."}]})
                         }
-                        Err(error) => {
-                            json!({"isError": true, "content": [{"type": "text", "text": error}]})
-                        }
-                    }
-                }
+                        Err(error) => tool_error(&error),
+                    },
+                },
                 _ => {
                     writeln!(
                         connection,
@@ -204,6 +212,19 @@ impl Server {
             )?;
         }
     }
+}
+
+fn reference_image(path: &Path) -> Result<Value> {
+    let media_type = crate::reference_media_type(path).ok_or("Unsupported reference image")?;
+    Ok(image_response(&std::fs::read(path)?, media_type))
+}
+
+fn image_response(image: &[u8], media_type: &str) -> Value {
+    json!({"content": [{"type": "image", "data": STANDARD.encode(image), "mimeType": media_type}]})
+}
+
+fn tool_error(error: &str) -> Value {
+    json!({"isError": true, "content": [{"type": "text", "text": error}]})
 }
 
 fn call(
@@ -244,7 +265,7 @@ fn call(
         .map_err(|_| "The drawing session did not respond")?
 }
 
-fn tools(narrate: bool) -> Vec<Value> {
+fn tools(narrate: bool, reference: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({
             "name": "screenshot",
@@ -286,6 +307,14 @@ fn tools(narrate: bool) -> Vec<Value> {
                 "type": "object", "required": ["narration"], "additionalProperties": false,
                 "properties": {"narration": {"type": "string", "minLength": 1, "maxLength": 200}}
             }
+        }));
+    }
+    if reference {
+        tools.push(json!({
+            "name": "reference",
+            "description": "See the reference image provided for this drawing.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": {"readOnlyHint": true}
         }));
     }
     tools

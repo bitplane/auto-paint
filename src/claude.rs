@@ -1,4 +1,4 @@
-use crate::harness::{self, Event, Model, ModelProbe, Process};
+use crate::harness::{self, Effort, Event, Model, ModelProbe, Process};
 use crate::{Result, Run};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -22,7 +22,7 @@ pub fn check_login() -> Result<()> {
 }
 
 pub fn models(directory: &Path) -> Result<Vec<Model>> {
-    let mut probe = ModelProbe::open(exec_command(directory, "haiku"))?;
+    let mut probe = ModelProbe::open(exec_command(directory, "haiku", None))?;
     // Claude Code returns the model picker entries in the SDK initialize response.
     probe.send(json!({
         "type": "control_request",
@@ -60,7 +60,7 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
             }
         }
     });
-    let mut command = exec_command(&run.output, run.model());
+    let mut command = exec_command(&run.output, run.model(), run.options.effort);
     command
         .arg("--mcp-config")
         .arg(config.to_string())
@@ -79,17 +79,18 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
 pub fn start_selection(
     directory: &Path,
     model: &str,
+    effort: Option<Effort>,
     schema: &Path,
     prompt: &str,
 ) -> Result<Process> {
-    let mut command = exec_command(directory, model);
+    let mut command = exec_command(directory, model, effort);
     command
         .arg("--json-schema")
         .arg(std::fs::read_to_string(schema)?);
     spawn(command, prompt, None, result_events)
 }
 
-fn exec_command(directory: &Path, model: &str) -> Command {
+fn exec_command(directory: &Path, model: &str, effort: Option<Effort>) -> Command {
     let mut command = harness::command("claude");
     command
         .args([
@@ -116,6 +117,9 @@ fn exec_command(directory: &Path, model: &str) -> Command {
             "You are the artist in Auto Paint. Follow the drawing or subject selection request.",
         ])
         .current_dir(directory);
+    if let Some(effort) = effort {
+        command.args(["--effort", effort.as_str()]);
+    }
     command
 }
 

@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::harness::Harness;
+use crate::harness::{Effort, Harness};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -87,9 +87,14 @@ impl Pick {
     }
 }
 
-pub fn choose(output: &Path, harness: Harness, model: &str) -> Result<(String, Option<String>)> {
+pub fn choose(
+    output: &Path,
+    harness: Harness,
+    model: &str,
+    effort: Option<Effort>,
+) -> Result<(String, Option<String>)> {
     let schema = output.join(".selection-schema.json");
-    let picks = choose_with_schema(output, harness, model, &schema);
+    let picks = choose_with_schema(output, harness, model, effort, &schema);
     let cleanup = std::fs::remove_file(schema);
     let (category, idea) = picks?;
     cleanup?;
@@ -113,6 +118,7 @@ fn choose_with_schema(
     output: &Path,
     harness: Harness,
     model: &str,
+    effort: Option<Effort>,
     schema: &Path,
 ) -> Result<(Pick, Pick)> {
     std::fs::write(schema, CATEGORY_SCHEMA)?;
@@ -121,6 +127,7 @@ fn choose_with_schema(
         output,
         harness,
         model,
+        effort,
         schema,
         CATEGORY_COUNT,
         &format!(
@@ -136,6 +143,7 @@ fn choose_with_schema(
         output,
         harness,
         model,
+        effort,
         schema,
         IDEA_COUNT,
         &format!(
@@ -154,11 +162,12 @@ fn pick(
     directory: &Path,
     harness: Harness,
     model: &str,
+    effort: Option<Effort>,
     schema: &Path,
     limit: usize,
     prompt: &str,
 ) -> Result<Pick> {
-    let (text, usage) = harness.structured_reply(directory, model, schema, prompt)?;
+    let (text, usage) = harness.structured_reply(directory, model, effort, schema, prompt)?;
     let suggestions: Suggestions = serde_json::from_str(&text)
         .map_err(|err| format!("Could not read {}'s suggestions: {err}", harness.name()))?;
     let mut seen = HashSet::new();

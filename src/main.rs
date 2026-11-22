@@ -1,3 +1,4 @@
+mod agy;
 mod claude;
 mod codex;
 mod drawing;
@@ -11,7 +12,7 @@ mod video;
 mod watch;
 
 use clap::Parser;
-use harness::Harness;
+use harness::{Effort, Harness};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -53,9 +54,12 @@ struct Options {
     /// CLI to drive the drawing.
     #[arg(long, value_enum, default_value = "codex")]
     harness: Harness,
-    /// Model name or family (Codex defaults to terra, Claude to haiku).
+    /// Model name or family (defaults to Terra, Haiku, or Gemini 3.8 Flash).
     #[arg(long)]
     model: Option<String>,
+    /// Reasoning effort for the selected model.
+    #[arg(long, value_enum)]
+    effort: Option<Effort>,
     /// Record a short local drawing without calling a model.
     #[arg(long)]
     smoke_test: bool,
@@ -91,7 +95,7 @@ impl Run {
             options.harness.check_login()?;
             options
                 .harness
-                .resolve_model(&root, options.model.as_deref())
+                .resolve_model(&root, options.model.as_deref(), options.effort)?
         };
 
         let output = match &options.output {
@@ -110,7 +114,8 @@ impl Run {
             && options.output.is_none()
             && reference.is_none();
         let (prompt, opening) = if random_subject {
-            let (subject, opening) = selection::choose(&output, options.harness, &model)?;
+            let (subject, opening) =
+                selection::choose(&output, options.harness, &model, options.effort)?;
             (
                 format!("Draw {subject}. Use bold shapes and a clear composition."),
                 opening,

@@ -1,4 +1,4 @@
-use crate::harness::{self, Event, Model, ModelProbe, Process};
+use crate::harness::{self, Effort, Event, Model, ModelProbe, Process};
 use crate::{Result, Run};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -102,7 +102,7 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
         .to_str()
         .ok_or("Auto Paint's executable path must be UTF-8")?;
     let server = "mcp_servers.paintrs";
-    let mut command = exec_command(&run.output, run.model());
+    let mut command = exec_command(&run.output, run.model(), run.options.effort);
     command
         .args([
             "-c",
@@ -132,7 +132,8 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
     spawn(command, prompt)
 }
 
-fn exec_command(directory: &Path, model: &str) -> Command {
+fn exec_command(directory: &Path, model: &str, effort: Option<Effort>) -> Command {
+    let effort = effort.unwrap_or(Effort::Low).as_str();
     let mut command = command();
     command
         .args([
@@ -152,7 +153,7 @@ fn exec_command(directory: &Path, model: &str) -> Command {
             "-m",
             model,
             "-c",
-            "model_reasoning_effort=\"low\"",
+            &format!("model_reasoning_effort=\"{effort}\""),
         ])
         .current_dir(directory);
     command
@@ -161,10 +162,11 @@ fn exec_command(directory: &Path, model: &str) -> Command {
 pub fn start_selection(
     directory: &Path,
     model: &str,
+    effort: Option<Effort>,
     schema: &Path,
     prompt: &str,
 ) -> Result<Process> {
-    let mut command = exec_command(directory, model);
+    let mut command = exec_command(directory, model, effort);
     command.arg("--output-schema").arg(schema);
     spawn(command, prompt)
 }
