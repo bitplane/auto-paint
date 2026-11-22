@@ -1,6 +1,6 @@
 [package]
 name = "auto-paint"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Watch Codex, Claude, Antigravity, or OpenCode draw in Paintrs and record the result"
