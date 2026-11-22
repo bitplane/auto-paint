@@ -1,11 +1,9 @@
+use crate::harness::{self, Event, Model, ModelProbe, Process};
 use crate::{Result, Run};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 pub fn check_login() -> Result<()> {
     let output = command()
@@ -26,42 +24,61 @@ pub fn check_login() -> Result<()> {
 }
 
 fn command() -> Command {
-    let mut command = Command::new(executable());
+    let mut command = harness::command("codex");
     command
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY");
     command
 }
 
-#[cfg(not(windows))]
-fn executable() -> &'static str {
-    "codex"
-}
-
-#[cfg(windows)]
-fn executable() -> std::path::PathBuf {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            for name in ["codex.exe", "codex.cmd"] {
-                let path = dir.join(name);
-                if path.is_file() {
-                    return path;
-                }
+pub fn models(directory: &Path) -> Result<Vec<Model>> {
+    let mut command = command();
+    command
+        .args(["app-server", "--stdio"])
+        .current_dir(directory);
+    let mut probe = ModelProbe::open(command)?;
+    probe.send(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {"clientInfo": {"name": "auto-paint", "version": env!("CARGO_PKG_VERSION")}}
+    }))?;
+    if probe.response(|value| value["id"] == 1)?["result"].is_null() {
+        return Err("Codex could not initialize its model listing".into());
+    }
+    probe.send(json!({"method": "initialized"}))?;
+    let mut cursor = Value::Null;
+    let mut models = Vec::new();
+    loop {
+        probe.send(json!({
+            "id": 2,
+            "method": "model/list",
+            "params": {"limit": 100, "cursor": cursor}
+        }))?;
+        let page = probe.response(|value| value["id"] == 2)?;
+        let rows = page["result"]["data"]
+            .as_array()
+            .ok_or("Codex could not list models")?;
+        models.extend(rows.iter().filter_map(|row| {
+            if row["inputModalities"]
+                .as_array()
+                .is_some_and(|modes| !modes.iter().any(|mode| mode == "image"))
+            {
+                return None;
             }
+            let id = row["model"].as_str()?;
+            Some(Model {
+                id: id.to_owned(),
+                display_name: row["displayName"].as_str().unwrap_or(id).to_owned(),
+            })
+        }));
+        cursor = page["result"]["nextCursor"].clone();
+        if cursor.is_null() {
+            return Ok(models);
         }
     }
-    "codex.exe".into()
 }
 
-pub enum Event {
-    Message(String),
-    Usage(Value),
-    Tool { name: String, status: String },
-    Error(String),
-}
-
-fn event(line: &str) -> Option<Event> {
-    let value = serde_json::from_str::<Value>(line).ok()?;
+fn event(value: &Value) -> Option<Event> {
     let kind = value["type"].as_str()?;
     let item = &value["item"];
     match kind {
@@ -79,86 +96,40 @@ fn event(line: &str) -> Option<Event> {
     }
 }
 
-pub struct Process {
-    child: Child,
-    pub events: Receiver<Event>,
-    reader: Option<thread::JoinHandle<()>>,
-}
-
-impl Process {
-    pub fn start(run: &Run, address: std::net::SocketAddr, token: &str) -> Result<Self> {
-        let executable = std::env::current_exe()?;
-        let executable = executable
-            .to_str()
-            .ok_or("Auto Paint's executable path must be UTF-8")?;
-        let server = "mcp_servers.paintrs";
-        let mut command = exec_command(&run.output, &run.options.model);
-        command
-            .args([
-                "-c",
-                &format!("{server}.command={}", toml_string(executable)),
-                "-c",
-                &format!(
-                    "{server}.args=[\"--mcp-stdio\",{}]",
-                    toml_string(&address.to_string()),
-                ),
-                "-c",
-                &format!("{server}.env_vars=[\"AUTO_PAINT_MCP_TOKEN\"]"),
-                "-c",
-                &format!("{server}.required=true"),
-                "-c",
-                &format!("{server}.tools.act.approval_mode=\"approve\""),
-            ])
-            .env("AUTO_PAINT_MCP_TOKEN", token);
-        if let Some(path) = &run.reference {
-            command.arg("--image").arg(path);
-        }
-        Self::spawn(command, &instructions(run))
+pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Result<Process> {
+    let executable = std::env::current_exe()?;
+    let executable = executable
+        .to_str()
+        .ok_or("Auto Paint's executable path must be UTF-8")?;
+    let server = "mcp_servers.paintrs";
+    let mut command = exec_command(&run.output, run.model());
+    command
+        .args([
+            "-c",
+            &format!("{server}.command={}", toml_string(executable)),
+            "-c",
+            &format!(
+                "{server}.args=[\"--mcp-stdio\",{}]",
+                toml_string(&address.to_string()),
+            ),
+            "-c",
+            &format!("{server}.env_vars=[\"AUTO_PAINT_MCP_TOKEN\"]"),
+            "-c",
+            &format!("{server}.required=true"),
+            "-c",
+            &format!("{server}.tools.act.approval_mode=\"approve\""),
+        ])
+        .env("AUTO_PAINT_MCP_TOKEN", token);
+    if run.options.narrate {
+        command.args([
+            "-c",
+            &format!("{server}.tools.review.approval_mode=\"approve\""),
+        ]);
     }
-
-    fn spawn(mut command: Command, prompt: &str) -> Result<Self> {
-        command.args(["--", "-"]);
-        let mut child = command.spawn()?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (send, events) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            for line in BufReader::new(stdout)
-                .lines()
-                .map_while(std::result::Result::ok)
-            {
-                if let Some(event) = event(&line)
-                    && send.send(event).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let mut process = Self {
-            child,
-            events,
-            reader: Some(reader),
-        };
-        let mut stdin = process.child.stdin.take().expect("piped stdin");
-        stdin.write_all(prompt.as_bytes())?;
-        Ok(process)
+    if let Some(path) = &run.reference {
+        command.arg("--image").arg(path);
     }
-
-    pub fn status(&mut self) -> Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        if status.is_some()
-            && let Some(reader) = self.reader.take()
-        {
-            let _ = reader.join();
-        }
-        Ok(status)
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    spawn(command, prompt)
 }
 
 fn exec_command(directory: &Path, model: &str) -> Command {
@@ -183,84 +154,29 @@ fn exec_command(directory: &Path, model: &str) -> Command {
             "-c",
             "model_reasoning_effort=\"low\"",
         ])
-        .current_dir(directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
+        .current_dir(directory);
     command
 }
 
-pub fn structured_reply(
+pub fn start_selection(
     directory: &Path,
     model: &str,
     schema: &Path,
     prompt: &str,
-) -> Result<(String, Option<Value>)> {
+) -> Result<Process> {
     let mut command = exec_command(directory, model);
     command.arg("--output-schema").arg(schema);
-    let mut process = Process::spawn(command, prompt)?;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut message = None;
-    let mut usage = None;
-    let mut error = None;
-    loop {
-        let status = process.status()?;
-        for event in process.events.try_iter() {
-            match event {
-                Event::Message(text) => message = Some(text),
-                Event::Usage(value) => usage = Some(value),
-                Event::Error(text) => error = Some(text),
-                Event::Tool { .. } => {}
-            }
-        }
-        if let Some(status) = status {
-            if !status.success() {
-                return Err(error
-                    .unwrap_or_else(|| format!("Codex exited with {status}"))
-                    .into());
-            }
-            return Ok((
-                message.ok_or("Codex returned no subject suggestions")?,
-                usage,
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err("Timed out waiting for Codex to suggest subjects".into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    spawn(command, prompt)
+}
+
+fn spawn(mut command: Command, prompt: &str) -> Result<Process> {
+    command.args(["--", "-"]);
+    Process::spawn(command, prompt.as_bytes(), |value| {
+        event(value).into_iter().collect()
+    })
 }
 
 fn toml_string(value: &str) -> String {
     // JSON's spaces, slashes and escaped quotes are also accepted in TOML basic strings.
     json!(value).to_string()
-}
-
-fn instructions(run: &Run) -> String {
-    let narration = if run.options.narrate {
-        " At major drawing steps, use the act call's narration field for one short first-person line \
-         about what you're doing in Paintrs. Use the latest screenshot. When a screenshot or tool result \
-         shows a mistake, say what you got wrong and how you're fixing it. Skip routine clicks."
-    } else {
-        ""
-    };
-    let selection_narration = if run.intro.is_some() {
-        " The recording announces the random choice in the first action batch. Narrate the major steps that follow."
-    } else {
-        ""
-    };
-    format!(
-        "Draw a picture using only the Paintrs screenshot and act tools. Start with a screenshot. \
-         Click and drag in the actual editor to create the image. Treat screenshots as window-local coordinates. \
-         Leave the finished picture visible. The app saves it automatically when you finish.{narration}{selection_narration}\n\n\
-         Drawing request: {}\n",
-        run.prompt,
-    )
-}
-
-pub fn save_usage(path: &Path, model: &str, usage: Value) -> Result<()> {
-    let report = json!({"backend": "codex", "model": model, "usage": usage});
-    let mut data = serde_json::to_vec_pretty(&report)?;
-    data.push(b'\n');
-    std::fs::write(path, data)?;
-    Ok(())
 }

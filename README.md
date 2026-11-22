@@ -2,6 +2,7 @@
 
 Install a [release binary](https://github.com/bitplane/auto-paint/releases), put [Codex](https://developers.openai.com/codex/cli/) on your PATH, and run `codex login`.
 Run `auto-paint --prompt "A sailboat at sunset"` to watch Codex draw and save a PNG and MP4.
+For Claude Code, run `claude auth login` and add `--harness claude`. It defaults to Haiku. Use `--model sol` with Codex to pick the newest available Sol, or pass a full model ID.
 Run `auto-paint` for a random subject. The category and idea picks are saved in `selection.json`.
 Voiceover and subtitles are on by default in the live window and MP4. Use `--no-narrate` for silence, `--reference photo.png` for a reference, or `--no-watch` to run headless.
 Use `--output my-take` to name the output directory. Run `auto-paint --help` for all options.

@@ -1,14 +1,17 @@
+mod claude;
 mod codex;
 mod drawing;
+mod harness;
 mod mcp;
 mod narration;
+mod overlay;
 mod playback;
 mod selection;
-mod subtitles;
 mod video;
 mod watch;
 
 use clap::Parser;
+use harness::Harness;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,7 +22,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-const DEFAULT_MODEL: &str = "gpt-6.1-terra";
 const WIDTH: u32 = 1000;
 const HEIGHT: u32 = 700;
 const FPS: u32 = 15;
@@ -27,10 +29,10 @@ const FPS: u32 = 15;
 #[derive(Parser)]
 #[command(version, about)]
 struct Options {
-    /// What Terra should draw.
+    /// What to draw.
     #[arg(long)]
     prompt: Option<String>,
-    /// Image to show Terra as a reference.
+    /// Image to use as a reference.
     #[arg(long, value_name = "IMAGE")]
     reference: Option<PathBuf>,
     /// New directory for the recording and final drawing.
@@ -48,10 +50,13 @@ struct Options {
     /// Maximum number of screenshot and action batches.
     #[arg(long, default_value_t = 45, value_parser = clap::value_parser!(u32).range(1..=1000))]
     turns: u32,
-    /// Codex model to use.
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    model: String,
-    /// Record a short local drawing without calling Codex.
+    /// CLI to drive the drawing.
+    #[arg(long, value_enum, default_value = "codex")]
+    harness: Harness,
+    /// Model name or family (Codex defaults to terra, Claude to haiku).
+    #[arg(long)]
+    model: Option<String>,
+    /// Record a short local drawing without calling a model.
     #[arg(long)]
     smoke_test: bool,
     #[arg(long, hide = true, value_name = "ADDRESS")]
@@ -60,10 +65,11 @@ struct Options {
 
 struct Run {
     options: Options,
+    model: String,
     output: PathBuf,
     prompt: String,
     reference: Option<PathBuf>,
-    intro: Option<String>,
+    opening: Option<String>,
 }
 
 impl Run {
@@ -74,23 +80,19 @@ impl Run {
             .as_ref()
             .map(std::fs::canonicalize)
             .transpose()?;
-        if let Some(path) = &reference {
-            let supported = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    matches!(
-                        ext.to_ascii_lowercase().as_str(),
-                        "png" | "jpg" | "jpeg" | "webp" | "gif"
-                    )
-                });
-            if !supported || !path.is_file() {
-                return Err("--reference expects a PNG, JPEG, WebP, or static GIF file".into());
-            }
+        if let Some(path) = &reference
+            && (reference_media_type(path).is_none() || !path.is_file())
+        {
+            return Err("--reference expects a PNG, JPEG, WebP, or static GIF file".into());
         }
-        if !options.smoke_test {
-            codex::check_login()?;
-        }
+        let model = if options.smoke_test {
+            String::new()
+        } else {
+            options.harness.check_login()?;
+            options
+                .harness
+                .resolve_model(&root, options.model.as_deref())
+        };
 
         let output = match &options.output {
             Some(path) => {
@@ -103,33 +105,46 @@ impl Run {
             None => unique_output(&root)?,
         };
         println!("Output: {}", output.display());
-        let (prompt, intro) = if !options.smoke_test
+        let random_subject = !options.smoke_test
             && options.prompt.is_none()
             && options.output.is_none()
-            && reference.is_none()
-        {
-            let (category, subject) = selection::choose(&output, &options.model)?;
-            let intro = options
-                .narrate
-                .then(|| format!("I landed on {category} and picked {subject}."));
+            && reference.is_none();
+        let (prompt, opening) = if random_subject {
+            let (subject, opening) = selection::choose(&output, options.harness, &model)?;
             (
                 format!("Draw {subject}. Use bold shapes and a clear composition."),
-                intro,
+                opening,
             )
         } else {
-            let prompt = options
-                .prompt
-                .clone()
-                .unwrap_or_else(|| default_prompt(options.output.as_deref(), reference.as_deref()));
-            (prompt, None)
+            (
+                options.prompt.clone().unwrap_or_else(|| {
+                    default_prompt(options.output.as_deref(), reference.as_deref())
+                }),
+                None,
+            )
         };
         Ok(Self {
             options,
+            model,
             output,
             prompt,
             reference,
-            intro,
+            opening,
         })
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+fn reference_media_type(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
     }
 }
 

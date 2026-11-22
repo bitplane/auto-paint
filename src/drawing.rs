@@ -1,7 +1,7 @@
-use crate::codex::{self, Event, Process};
-use crate::mcp::{Action, Batch, Button, Point, Server};
+use crate::harness::Event;
+use crate::mcp::{Action, Batch, Button, Command, Point, Server};
 use crate::narration::Narration;
-use crate::subtitles::Subtitles;
+use crate::overlay::Overlays;
 use crate::video::Video;
 use crate::{FPS, HEIGHT, Result, Run, WIDTH};
 use paintrs::automation::{Modifiers, NamedKey, Session};
@@ -30,7 +30,7 @@ pub fn run(
     let result = if run.options.smoke_test {
         drawing.smoke_test()
     } else {
-        drawing.run_codex(&run)
+        drawing.run_harness(&run)
     };
     let output = drawing.finish(&run);
     if let Err(error) = &output {
@@ -54,8 +54,9 @@ struct Drawing<'a> {
     deadline: Instant,
     pointer: Point,
     narration: Option<Narration>,
-    subtitles: Option<Subtitles>,
-    captioned: Vec<u32>,
+    review: Option<String>,
+    overlays: Option<Overlays>,
+    composited: Vec<u32>,
 }
 
 impl<'a> Drawing<'a> {
@@ -67,7 +68,9 @@ impl<'a> Drawing<'a> {
         let video = Video::new(&run.output.join(".drawing.mp4"), run.options.narrate)?;
         let session = Session::new(WIDTH, HEIGHT)?;
         let narration = run.options.narrate.then(Narration::new).transpose()?;
-        let subtitles = run.options.narrate.then(Subtitles::new).transpose()?;
+        let overlays = (run.options.narrate || !run.model().is_empty())
+            .then(|| Overlays::new(run.model()))
+            .transpose()?;
         let now = Instant::now();
         let mut drawing = Self {
             session,
@@ -79,8 +82,9 @@ impl<'a> Drawing<'a> {
             deadline: now + RUN_LIMIT,
             pointer: Point { x: -1, y: -1 },
             narration,
-            subtitles,
-            captioned: Vec::new(),
+            review: None,
+            overlays,
+            composited: Vec::new(),
         };
         drawing.render();
         Ok(drawing)
@@ -91,6 +95,10 @@ impl<'a> Drawing<'a> {
         if self.start.is_none()
             && let Some(preview) = &mut self.preview
         {
+            let pixels = match &mut self.overlays {
+                Some(overlays) => overlays.compose(&mut self.composited, pixels, None),
+                None => pixels,
+            };
             preview(Preview::Frame(pixels));
         }
     }
@@ -148,57 +156,89 @@ impl<'a> Drawing<'a> {
         }
     }
 
-    fn run_codex(&mut self, run: &Run) -> Result<()> {
+    fn run_harness(&mut self, run: &Run) -> Result<()> {
         let server = Server::bind()?;
         let (address, token) = (server.address, server.token.clone());
-        let requests = server.start(run.options.turns)?;
-        let mut codex = Process::start(run, address, &token)?;
+        let requests = server.start(run.options.turns, run.options.narrate)?;
+        let harness = run.options.harness;
+        let mut process = harness.start(run, address, &token)?;
         let mut usage = None;
         loop {
             self.check_active()?;
             self.sample()?;
             match requests.recv_timeout(Duration::from_millis(12)) {
                 Ok(request) => {
-                    let result = request
-                        .batch
-                        .map_or(Ok(()), |batch| self.batch(batch, run.intro.as_deref()));
-                    let result = result
-                        .map_err(|err| err.to_string())
-                        .and_then(|()| self.session.screenshot());
-                    let _ = request.reply.send(result);
+                    let _ = request
+                        .reply
+                        .send(self.command(request.command, run.opening.as_deref()));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     thread::sleep(Duration::from_millis(12));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let status = codex.status()?;
-            for event in codex.events.try_iter() {
+            let status = process.status()?;
+            for event in process.events.try_iter() {
                 match event {
                     Event::Message(text) => println!("{text}"),
                     Event::Tool { name, status } => println!("Paintrs {name} ({status})"),
                     Event::Usage(report) => usage = Some(report),
                     Event::Error(text) => eprintln!("{text}"),
+                    Event::Model(model) => {
+                        if let Some(overlays) = &mut self.overlays {
+                            overlays.set_model(&model);
+                            self.render();
+                        }
+                    }
                 }
             }
             if let Some(status) = status {
                 if let Some(usage) = usage {
-                    codex::save_usage(&run.output.join("usage.json"), &run.options.model, usage)?;
+                    harness.save_usage(&run.output.join("usage.json"), run.model(), usage)?;
                 }
                 if !status.success() {
-                    return Err(format!("Codex exited with {status}").into());
+                    return Err(format!("{} exited with {status}", harness.name()).into());
                 }
                 return Ok(());
             }
         }
     }
 
-    fn batch(&mut self, batch: Batch, intro: Option<&str>) -> Result<()> {
+    fn command(
+        &mut self,
+        command: Command,
+        opening: Option<&str>,
+    ) -> std::result::Result<Option<Vec<u8>>, String> {
+        match command {
+            Command::Screenshot => self.session.screenshot().map(Some),
+            Command::Act(batch) => {
+                if self.review.is_some() {
+                    return Err("The drawing is already finished".into());
+                }
+                self.batch(batch, opening)
+                    .map_err(|error| error.to_string())?;
+                self.session.screenshot().map(Some)
+            }
+            Command::Review(line) => {
+                if self.start.is_none() {
+                    return Err("Draw something before submitting the review".into());
+                }
+                if self.review.is_some() {
+                    return Err("The final review is already recorded".into());
+                }
+                println!("Final review {line:?}");
+                self.review = Some(line);
+                Ok(None)
+            }
+        }
+    }
+
+    fn batch(&mut self, batch: Batch, opening: Option<&str>) -> Result<()> {
         if !(1..=128).contains(&batch.actions.len()) {
             return Err("An action batch needs 1 to 128 actions".into());
         }
         let line = if self.start.is_none() {
-            intro.or(batch.narration.as_deref())
+            opening.or(batch.narration.as_deref())
         } else {
             batch.narration.as_deref()
         };
@@ -230,13 +270,11 @@ impl<'a> Drawing<'a> {
             .narration
             .as_ref()
             .and_then(|voice| voice.subtitle_at(frame));
-        let mut pixels = self.session.pixels();
-        if let (Some(subtitles), Some(text)) = (&mut self.subtitles, subtitle) {
-            self.captioned.clear();
-            self.captioned.extend_from_slice(pixels);
-            subtitles.draw(text, &mut self.captioned);
-            pixels = &self.captioned;
-        }
+        let pixels = self.session.pixels();
+        let pixels = match &mut self.overlays {
+            Some(overlays) => overlays.compose(&mut self.composited, pixels, subtitle),
+            None => pixels,
+        };
         if self.video.write(pixels, frame)?
             && let Some(preview) = &mut self.preview
         {
@@ -249,12 +287,8 @@ impl<'a> Drawing<'a> {
         self.check_active()?;
         match action {
             Action::Move { x, y } => self.move_pointer(Point { x, y })?,
-            Action::Click { x, y, button } => self.click(Point { x, y }, button)?,
-            Action::DoubleClick { x, y, button } => {
-                let point = Point { x, y };
-                self.click(point, button)?;
-                self.click(point, button)?;
-            }
+            Action::Click { x, y, button } => self.click(Point { x, y }, button, false)?,
+            Action::DoubleClick { x, y, button } => self.click(Point { x, y }, button, true)?,
             Action::Drag { path, button } => self.drag(&path, button)?,
             Action::Scroll {
                 x,
@@ -300,10 +334,10 @@ impl<'a> Drawing<'a> {
         Ok(())
     }
 
-    fn click(&mut self, point: Point, button: Button) -> Result<()> {
+    fn click(&mut self, point: Point, button: Button, double: bool) -> Result<()> {
         self.move_pointer(point)?;
         let right = matches!(button, Button::Right);
-        self.session.button(right, true);
+        self.session.press(right, double);
         self.render();
         let waited = self.wait(CLICK_HOLD);
         self.session.button(right, false);
@@ -318,7 +352,7 @@ impl<'a> Drawing<'a> {
         }
         self.move_pointer(path[0])?;
         let right = matches!(button, Button::Right);
-        self.session.button(right, true);
+        self.session.press(right, false);
         self.render();
         let result = path[1..].iter().try_for_each(|&end| self.stroke_to(end));
         self.session.button(right, false);
@@ -344,7 +378,7 @@ impl<'a> Drawing<'a> {
     fn smoke_test(&mut self) -> Result<()> {
         self.start_recording()?;
         self.cue("I am drawing a line in Paintrs.");
-        self.click(Point { x: 22, y: 151 }, Button::Left)?;
+        self.click(Point { x: 22, y: 151 }, Button::Left, false)?;
         self.drag(
             &[
                 Point { x: 180, y: 145 },
@@ -362,6 +396,12 @@ impl<'a> Drawing<'a> {
         self.session.move_pointer(-1, -1);
         self.render();
         let start = self.start_recording()?;
+        if let (Some(review), Some(narration)) = (self.review.as_deref(), &mut self.narration)
+            && let Some(samples) = narration.add_review(start.elapsed(), review)
+            && let Some(preview) = &mut self.preview
+        {
+            preview(Preview::Speech(samples));
+        }
         let audio_duration = self.narration.as_ref().map_or(0.0, Narration::duration);
         if self.preview.is_some() && audio_duration > 0.0 {
             // Keep the window and output device alive while the final cue plays out.
@@ -434,4 +474,47 @@ fn parse_keys(keys: &[String]) -> Result<(Key, Modifiers)> {
         _ => return Err(format!("Unsupported key {key:?}").into()),
     };
     Ok((Key::Named(named), mask))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn polygon_clicks_keep_their_intended_click_count() -> Result<()> {
+        let output = crate::unique_output(&std::env::temp_dir())?;
+        let run = Run {
+            options: crate::Options::parse_from(["auto-paint", "--smoke-test", "--no-narrate"]),
+            model: String::new(),
+            output: output.clone(),
+            prompt: String::new(),
+            reference: None,
+            opening: None,
+        };
+        let pixels = (|| -> Result<[u32; 3]> {
+            let mut drawing = Drawing::new(&run, Arc::new(AtomicBool::new(false)), None)?;
+            let point = |x, y| Point { x, y };
+            let left = Button::Left;
+            drawing.click(point(52, 235), left, false)?;
+            drawing.click(point(35, 343), left, false)?;
+            drawing.drag(&[point(170, 110), point(280, 110)], left)?;
+            drawing.click(point(225, 209), left, false)?;
+            drawing.click(point(225, 209), left, true)?;
+            drawing.drag(&[point(340, 110), point(450, 110)], left)?;
+            drawing.click(point(395, 209), left, true)?;
+            drawing.drag(&[point(510, 110), point(620, 110)], left)?;
+            drawing.click(point(620, 210), left, false)?;
+            drawing.click(point(617, 212), left, false)?;
+            drawing.click(point(510, 210), left, false)?;
+            drawing.act(Action::Keypress {
+                keys: vec!["ENTER".into()],
+            })?;
+            Ok([(225, 150), (395, 150), (530, 185)]
+                .map(|(x, y)| drawing.session.pixels()[y * WIDTH as usize + x]))
+        })();
+        std::fs::remove_dir_all(output)?;
+        assert_eq!(pixels?, [0; 3]);
+        Ok(())
+    }
 }

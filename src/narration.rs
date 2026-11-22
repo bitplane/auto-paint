@@ -33,10 +33,18 @@ impl Narration {
     }
 
     pub fn add(&mut self, at: Duration, text: &str) -> Option<&[i16]> {
-        let offset = (at.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize;
+        let offset = sample_offset(at);
         if offset < self.samples.len() || self.cues.len() == 128 {
             return None;
         }
+        self.add_at(offset, text)
+    }
+
+    pub fn add_review(&mut self, at: Duration, text: &str) -> Option<&[i16]> {
+        self.add_at(sample_offset(at).max(self.samples.len()), text)
+    }
+
+    fn add_at(&mut self, offset: usize, text: &str) -> Option<&[i16]> {
         let text: String = text
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -102,6 +110,10 @@ impl Narration {
     }
 }
 
+fn sample_offset(at: Duration) -> usize {
+    (at.as_secs_f64() * f64::from(SAMPLE_RATE)).round() as usize
+}
+
 fn write_packets(
     encoder: &mut AacEncoder,
     mux: &mut Muxer<impl Write>,
@@ -122,4 +134,31 @@ fn write_packets(
         *index += 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_final_review_while_another_line_is_playing() -> Result<()> {
+        let mut narration = Narration::new()?;
+        let opening = narration
+            .add(Duration::ZERO, "I am drawing a line.")
+            .unwrap();
+        let opening_end = opening.len() as u64;
+        assert!(
+            narration
+                .add_review(Duration::ZERO, "That line looks lost.")
+                .is_some()
+        );
+        assert_eq!(narration.cues[1].start, opening_end);
+        let review_frame =
+            ((opening_end + AAC_FRAME as u64) * u64::from(FPS)).div_ceil(u64::from(SAMPLE_RATE));
+        assert_eq!(
+            narration.subtitle_at(review_frame),
+            Some("That line looks lost.")
+        );
+        Ok(())
+    }
 }

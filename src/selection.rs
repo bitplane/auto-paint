@@ -1,4 +1,5 @@
-use crate::{Result, codex};
+use crate::Result;
+use crate::harness::Harness;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -6,7 +7,7 @@ use std::path::Path;
 
 const CATEGORY_COUNT: usize = 10;
 const IDEA_COUNT: usize = 8;
-const SCHEMA: &str = r#"{
+const CATEGORY_SCHEMA: &str = r#"{
     "type": "object",
     "properties": {
         "options": { "type": "array", "items": { "type": "string" } }
@@ -14,42 +15,87 @@ const SCHEMA: &str = r#"{
     "required": ["options"],
     "additionalProperties": false
 }"#;
+const IDEA_SCHEMA: &str = r#"{
+    "type": "object",
+    "properties": {
+        "options": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string" },
+                    "opening": { "type": "string" }
+                },
+                "required": ["subject", "opening"],
+                "additionalProperties": false
+            }
+        }
+    },
+    "required": ["options"],
+    "additionalProperties": false
+}"#;
 
 #[derive(Deserialize)]
 struct Suggestions {
-    options: Vec<String>,
+    options: Vec<Suggestion>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Suggestion {
+    Category(String),
+    Idea { subject: String, opening: String },
+}
+
+impl Suggestion {
+    fn subject(&self) -> &str {
+        match self {
+            Self::Category(subject) | Self::Idea { subject, .. } => subject,
+        }
+    }
+
+    fn opening(&self) -> Option<&str> {
+        match self {
+            Self::Category(_) => None,
+            Self::Idea { opening, .. } => Some(opening.trim()).filter(|line| !line.is_empty()),
+        }
+    }
 }
 
 struct Pick {
-    candidates: Vec<String>,
+    candidates: Vec<Suggestion>,
     index: usize,
     usage: Option<Value>,
 }
 
 impl Pick {
-    fn selected(&self) -> &str {
+    fn selected(&self) -> &Suggestion {
         &self.candidates[self.index]
     }
 
     fn report(&self) -> Value {
-        json!({
-            "candidates": self.candidates,
+        let mut report = json!({
+            "candidates": self.candidates.iter().map(Suggestion::subject).collect::<Vec<_>>(),
             "selected_index": self.index,
-            "selected": self.selected(),
+            "selected": self.selected().subject(),
             "usage": self.usage,
-        })
+        });
+        if let Some(opening) = self.selected().opening() {
+            report["opening"] = json!(opening);
+        }
+        report
     }
 }
 
-pub fn choose(output: &Path, model: &str) -> Result<(String, String)> {
+pub fn choose(output: &Path, harness: Harness, model: &str) -> Result<(String, Option<String>)> {
     let schema = output.join(".selection-schema.json");
-    std::fs::write(&schema, SCHEMA)?;
-    let picks = choose_with_schema(output, model, &schema);
+    let picks = choose_with_schema(output, harness, model, &schema);
     let cleanup = std::fs::remove_file(schema);
     let (category, idea) = picks?;
     cleanup?;
 
     let report = json!({
+        "backend": harness.name(),
         "model": model,
         "category": category.report(),
         "idea": idea.report(),
@@ -57,50 +103,84 @@ pub fn choose(output: &Path, model: &str) -> Result<(String, String)> {
     let mut data = serde_json::to_vec_pretty(&report)?;
     data.push(b'\n');
     std::fs::write(output.join("selection.json"), data)?;
-    println!("Drawing: {}", idea.selected());
+    let idea = idea.selected();
+    println!("Drawing: {}", idea.subject());
 
-    Ok((category.selected().to_owned(), idea.selected().to_owned()))
+    Ok((idea.subject().to_owned(), idea.opening().map(str::to_owned)))
 }
 
-fn choose_with_schema(output: &Path, model: &str, schema: &Path) -> Result<(Pick, Pick)> {
+fn choose_with_schema(
+    output: &Path,
+    harness: Harness,
+    model: &str,
+    schema: &Path,
+) -> Result<(Pick, Pick)> {
+    std::fs::write(schema, CATEGORY_SCHEMA)?;
     println!("Choosing a painting category");
     let category = pick(
         output,
+        harness,
         model,
         schema,
         CATEGORY_COUNT,
         &format!(
-            "List {CATEGORY_COUNT} distinct, equally broad categories for colourful paintings              in a classic paint program. Cover different subject areas.              Return the category names as short noun phrases in the options array."
+            "List {CATEGORY_COUNT} distinct, equally broad categories for colourful paintings \
+             in a classic paint program. Cover different subject areas. \
+             Return the category names as short noun phrases in the options array."
         ),
     )?;
-    println!("Choosing an idea in {}", category.selected());
+    let category_name = category.selected().subject();
+    println!("Choosing an idea in {category_name}");
+    std::fs::write(schema, IDEA_SCHEMA)?;
     let idea = pick(
         output,
+        harness,
         model,
         schema,
         IDEA_COUNT,
         &format!(
-            "List {IDEA_COUNT} very different concrete painting ideas for the category {:?}.              Each should be a recognisable scene that fits a 720 by 480 canvas and can be              drawn with simple shapes and a few colours. Write each as a short noun phrase              in the options array, suitable to follow the words 'I picked'.",
-            category.selected()
+            "List {IDEA_COUNT} very different concrete painting ideas for the category {category_name:?}. \
+             Each should be a recognisable scene that fits a 720 by 480 canvas and can be \
+             drawn with simple shapes and a few colours. Write the subject as a short noun phrase. \
+             For each idea, write an opening of one short, spontaneous first-person sentence you \
+             would say aloud if you'd just decided to draw it. Name the subject and say what makes \
+             it appealing to draw. Vary the phrasing across the ideas. Keep each opening under 120 characters."
         ),
     )?;
     Ok((category, idea))
 }
 
-fn pick(directory: &Path, model: &str, schema: &Path, limit: usize, prompt: &str) -> Result<Pick> {
-    let (text, usage) = codex::structured_reply(directory, model, schema, prompt)?;
+fn pick(
+    directory: &Path,
+    harness: Harness,
+    model: &str,
+    schema: &Path,
+    limit: usize,
+    prompt: &str,
+) -> Result<Pick> {
+    let (text, usage) = harness.structured_reply(directory, model, schema, prompt)?;
     let suggestions: Suggestions = serde_json::from_str(&text)
-        .map_err(|err| format!("Could not read Codex's suggestions: {err}"))?;
+        .map_err(|err| format!("Could not read {}'s suggestions: {err}", harness.name()))?;
     let mut seen = HashSet::new();
-    let candidates: Vec<String> = suggestions
+    let candidates: Vec<Suggestion> = suggestions
         .options
         .into_iter()
-        .map(|entry| entry.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|entry| !entry.is_empty() && seen.insert(entry.to_lowercase()))
+        .map(|mut entry| {
+            let subject = match &mut entry {
+                Suggestion::Category(subject) | Suggestion::Idea { subject, .. } => subject,
+            };
+            *subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
+            entry
+        })
+        .filter(|entry| !entry.subject().is_empty() && seen.insert(entry.subject().to_lowercase()))
         .take(limit)
         .collect();
     if candidates.len() < 2 {
-        return Err("Codex returned fewer than two distinct suggestions".into());
+        return Err(format!(
+            "{} returned fewer than two distinct suggestions",
+            harness.name()
+        )
+        .into());
     }
     let count = candidates.len() as u64;
     let range = u64::from(u32::MAX) + 1;
