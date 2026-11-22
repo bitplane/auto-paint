@@ -316,7 +316,7 @@ fn select_agy_model<'a>(
     })
 }
 
-fn split_model_effort(model: &str) -> (&str, Option<&str>) {
+pub fn split_model_effort(model: &str) -> (&str, Option<&str>) {
     if let Some((family, suffix)) = model.rsplit_once(['-', ' '])
         && Effort::from_str(suffix, false).is_ok()
     {

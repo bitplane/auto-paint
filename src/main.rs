@@ -148,6 +148,17 @@ impl Run {
     fn model(&self) -> &str {
         &self.model
     }
+
+    fn overlay_model<'a>(&self, model: &'a str) -> (&'a str, &'a str) {
+        let (name, variant) = match self.options.harness {
+            Harness::Agy => harness::split_model_effort(model),
+            _ => (model, None),
+        };
+        let effort = variant
+            .or(self.options.effort.map(Effort::as_str))
+            .unwrap_or("default effort");
+        (name, effort)
+    }
 }
 
 fn reference_media_type(path: &Path) -> Option<&'static str> {

@@ -6,6 +6,7 @@ use fontdue::{Font, FontSettings};
 
 const SIDE_PADDING: f32 = 24.0;
 const VERTICAL_PADDING: f32 = 4.0;
+const MODEL_LABEL_LENGTH: usize = 100;
 
 struct Style {
     top: usize,
@@ -45,7 +46,7 @@ struct TextMask {
 }
 
 impl Overlays {
-    pub fn new(model: &str) -> Result<Self> {
+    pub fn new(model: &str, effort: &str) -> Result<Self> {
         let font = Font::from_bytes(
             include_bytes!("../assets/LiberationSans-Regular.ttf").as_slice(),
             FontSettings::default(),
@@ -56,12 +57,20 @@ impl Overlays {
             model: TextMask::new(MODEL),
             caption: TextMask::new(CAPTION),
         };
-        overlays.set_model(model);
+        overlays.set_model(model, effort);
         Ok(overlays)
     }
 
-    pub fn set_model(&mut self, model: &str) {
-        let label: String = model.chars().take(100).collect();
+    pub fn set_model(&mut self, model: &str, effort: &str) {
+        let label = if model.is_empty() {
+            String::new()
+        } else {
+            let suffix = format!(" ({effort})");
+            let model_length = MODEL_LABEL_LENGTH.saturating_sub(suffix.chars().count());
+            let mut label: String = model.chars().take(model_length).collect();
+            label.push_str(&suffix);
+            label
+        };
         self.model.update(&self.font, &mut self.layout, &label);
     }
 

@@ -71,8 +71,9 @@ impl<'a> Drawing<'a> {
         let video = Video::new(&run.output.join(".drawing.mp4"), run.options.narrate)?;
         let session = Session::new(WIDTH, HEIGHT)?;
         let narration = run.options.narrate.then(Narration::new).transpose()?;
+        let (model, effort) = run.overlay_model(run.model());
         let overlays = (run.options.narrate || !run.model().is_empty())
-            .then(|| Overlays::new(run.model()))
+            .then(|| Overlays::new(model, effort))
             .transpose()?;
         let now = Instant::now();
         let mut drawing = Self {
@@ -199,7 +200,8 @@ impl<'a> Drawing<'a> {
                     Event::Error(text) => eprintln!("{text}"),
                     Event::Model(model) => {
                         if let Some(overlays) = &mut self.overlays {
-                            overlays.set_model(&model);
+                            let (model, effort) = run.overlay_model(&model);
+                            overlays.set_model(model, effort);
                             self.render();
                         }
                     }
