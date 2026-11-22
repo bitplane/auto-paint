@@ -15,7 +15,6 @@ def licenses():
     target = next(line.removeprefix("host: ") for line in rust.splitlines() if line.startswith("host: "))
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", target],
-        text=True,
     ))
     for package in metadata["packages"]:
         name = package["name"]
@@ -57,7 +56,7 @@ def main():
     ]
     if windows:
         archive = output / f"{stem}.zip"
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
             for path, name in files:
                 bundle.write(path, name)
     else:
