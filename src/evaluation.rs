@@ -1,9 +1,9 @@
-use crate::harness::Query;
+use crate::harness::{Query, Workspace};
 use crate::{Result, Run};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 const GOOD_SCORE: u8 = 7;
@@ -48,7 +48,7 @@ pub fn review(
     picture: &Path,
     cancelled: &AtomicBool,
 ) -> Result<String> {
-    let workspace = Workspace(crate::unique_output(&std::env::temp_dir())?);
+    let workspace = Workspace::new()?;
     let image = workspace.0.join("image.png");
     fs::copy(picture, &image)?;
     let schema = workspace.0.join("response.json");
@@ -139,14 +139,6 @@ fn closing_line<'a>(blind: &'a BlindReview, comparison: &'a Comparison) -> (&'st
         (tone(blind.score), comparison.line.trim())
     } else {
         ("mismatch", blind.description.trim())
-    }
-}
-
-struct Workspace(PathBuf);
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

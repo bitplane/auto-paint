@@ -82,6 +82,10 @@ impl Narration {
         self.samples.len() as f64 / f64::from(SAMPLE_RATE)
     }
 
+    pub fn subtitled_duration(&self) -> Duration {
+        Duration::from_secs_f64(self.duration() + AAC_FRAME as f64 / f64::from(SAMPLE_RATE))
+    }
+
     pub fn write_to(self, mux: &mut Muxer<impl Write>) -> Result<()> {
         let mut encoder = AacEncoder::new(AacEncoderConfig {
             bitrate_bps: 32_000,

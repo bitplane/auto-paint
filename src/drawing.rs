@@ -15,6 +15,7 @@ const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64
 const RUN_LIMIT: Duration = Duration::from_secs(900);
 const BATCH_LIMIT: Duration = Duration::from_secs(40);
 const CLICK_HOLD: Duration = Duration::from_millis(35);
+const WAIT_TAIL: Duration = Duration::from_millis(500);
 
 pub enum Preview<'a> {
     Frame(&'a [u32]),
@@ -50,6 +51,8 @@ struct Drawing<'a> {
     preview: Option<&'a mut dyn FnMut(Preview<'_>)>,
     cancelled: Arc<AtomicBool>,
     start: Option<Instant>,
+    trim_waits: bool,
+    wait_cutoff: Option<Instant>,
     last_frame: Option<u64>,
     deadline: Instant,
     pointer: Point,
@@ -78,6 +81,8 @@ impl<'a> Drawing<'a> {
             preview,
             cancelled,
             start: None,
+            trim_waits: run.options.trim_waits,
+            wait_cutoff: None,
             last_frame: None,
             deadline: now + RUN_LIMIT,
             pointer: Point { x: -1, y: -1 },
@@ -92,7 +97,10 @@ impl<'a> Drawing<'a> {
 
     fn render(&mut self) {
         let pixels = self.session.render();
-        if self.start.is_none()
+        if (self.start.is_none()
+            || self
+                .wait_cutoff
+                .is_some_and(|cutoff| Instant::now() >= cutoff))
             && let Some(preview) = &mut self.preview
         {
             let pixels = match &mut self.overlays {
@@ -121,10 +129,11 @@ impl<'a> Drawing<'a> {
         let Some(start) = self.start else {
             return Ok(());
         };
+        let recorded_now = self.wait_cutoff.map_or(now, |cutoff| now.min(cutoff));
         let frame = if self.last_frame.is_none() {
             0
         } else {
-            (now.duration_since(start).as_nanos() * u128::from(FPS) / 1_000_000_000) as u64
+            (recorded_now.duration_since(start).as_nanos() * u128::from(FPS) / 1_000_000_000) as u64
         };
         if self.last_frame.is_none_or(|last| frame > last) {
             self.write_frame(frame)?;
@@ -216,10 +225,34 @@ impl<'a> Drawing<'a> {
         match command {
             Command::Screenshot => self.session.screenshot(),
             Command::Act(batch) => {
-                self.batch(batch, opening)
-                    .map_err(|error| error.to_string())?;
-                self.session.screenshot()
+                self.end_model_wait(Instant::now());
+                let response = self
+                    .batch(batch, opening)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| self.session.screenshot());
+                self.begin_model_wait(Instant::now());
+                response
             }
+        }
+    }
+
+    fn begin_model_wait(&mut self, now: Instant) {
+        if self.trim_waits
+            && let Some(start) = self.start
+        {
+            let speech_end = self
+                .narration
+                .as_ref()
+                .map_or(start, |narration| start + narration.subtitled_duration());
+            self.wait_cutoff = Some(now.max(speech_end) + WAIT_TAIL);
+        }
+    }
+
+    fn end_model_wait(&mut self, now: Instant) {
+        if let Some(cutoff) = self.wait_cutoff.take()
+            && let Some(start) = &mut self.start
+        {
+            *start += now.saturating_duration_since(cutoff);
         }
     }
 
@@ -388,6 +421,7 @@ impl<'a> Drawing<'a> {
     }
 
     fn finish(mut self, run: &Run, completed: bool) -> Result<()> {
+        self.end_model_wait(Instant::now());
         let picture = run.output.join("drawing.png");
         self.session.finish(&picture)?;
         self.session.move_pointer(-1, -1);
@@ -501,6 +535,41 @@ fn parse_keys(keys: &[String]) -> Result<(Key, Modifiers)> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn a_model_wait_keeps_speech_and_a_short_pause() -> Result<()> {
+        let workspace = crate::harness::Workspace::new()?;
+        let run = Run {
+            options: crate::Options::parse_from(["auto-paint", "--trim-waits"]),
+            model: String::new(),
+            output: workspace.0.clone(),
+            prompt: String::new(),
+            reference: None,
+            opening: None,
+        };
+        let mut drawing = Drawing::new(&run, Arc::new(AtomicBool::new(false)), None)?;
+        let start = Instant::now();
+        drawing.start = Some(start);
+        let narration = drawing.narration.as_mut().unwrap();
+        assert!(
+            narration
+                .add(Duration::ZERO, "I'm painting the first shape.")
+                .is_some()
+        );
+        let speech_end = start + narration.subtitled_duration();
+
+        drawing.begin_model_wait(start);
+        assert_eq!(drawing.wait_cutoff, Some(speech_end + WAIT_TAIL));
+        drawing.end_model_wait(speech_end);
+        assert_eq!(drawing.start, Some(start));
+
+        drawing.begin_model_wait(start);
+        let discarded = Duration::from_secs(10);
+        drawing.end_model_wait(speech_end + WAIT_TAIL + discarded);
+        assert_eq!(drawing.start, Some(start + discarded));
+        assert_eq!(drawing.wait_cutoff, None);
+        Ok(())
+    }
 
     #[test]
     fn polygon_clicks_keep_their_intended_click_count() -> Result<()> {

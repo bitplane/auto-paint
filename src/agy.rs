@@ -68,7 +68,7 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
         prompt.to_owned()
     };
     command.arg("--print").arg(prompt);
-    Ok(Process::spawn(command, &[], events)?.with_agy_config(config))
+    Ok(Process::spawn(command, &[], events)?.with_workspace(config))
 }
 
 pub fn start_query(query: Query<'_>) -> Result<Process> {
@@ -90,7 +90,7 @@ pub fn start_query(query: Query<'_>) -> Result<Process> {
         query.prompt
     );
     command.arg("--print").arg(prompt);
-    Ok(Process::spawn(command, &[], selection_events)?.with_agy_config(config))
+    Ok(Process::spawn(command, &[], selection_events)?.with_workspace(config))
 }
 
 fn exec_command(directory: &Path, model: &str, effort: Option<Effort>, drawing: bool) -> Command {

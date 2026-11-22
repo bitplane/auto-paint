@@ -3,8 +3,10 @@ mod claude;
 mod codex;
 mod drawing;
 mod evaluation;
+mod grok;
 mod harness;
 mod mcp;
+mod muse;
 mod narration;
 mod opencode;
 mod overlay;
@@ -44,6 +46,9 @@ struct Options {
     /// Record with no visible window.
     #[arg(long)]
     no_watch: bool,
+    /// Shorten silent waits for the model in the saved video.
+    #[arg(long)]
+    trim_waits: bool,
     /// Record without voiceover or subtitles.
     #[arg(long = "no-narrate", action = clap::ArgAction::SetFalse)]
     narrate: bool,

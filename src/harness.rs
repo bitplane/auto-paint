@@ -1,9 +1,9 @@
-use crate::{Result, Run, agy, claude, codex, opencode};
+use crate::{Result, Run, agy, claude, codex, grok, muse, opencode};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -16,6 +16,8 @@ pub enum Harness {
     Claude,
     Agy,
     Opencode,
+    Grok,
+    Muse,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -46,6 +48,8 @@ impl Harness {
             Self::Claude => "claude",
             Self::Agy => "agy",
             Self::Opencode => "opencode",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
         }
     }
 
@@ -69,6 +73,16 @@ impl Harness {
                 println!("Model: {model} (opencode)");
                 return Ok(model);
             }
+            Self::Grok => {
+                let model = grok::resolve_model(directory, requested)?;
+                println!("Model: {model} (grok)");
+                return Ok(model);
+            }
+            Self::Muse => {
+                let model = muse::resolve_model(directory, requested)?;
+                println!("Model: {model} (muse)");
+                return Ok(model);
+            }
         };
         let query = requested.unwrap_or(family);
         let matched = match models {
@@ -87,7 +101,7 @@ impl Harness {
         match self {
             Self::Codex => codex::check_login(),
             Self::Claude => claude::check_login(),
-            Self::Agy | Self::Opencode => Ok(()),
+            Self::Agy | Self::Opencode | Self::Grok | Self::Muse => Ok(()),
         }
     }
 
@@ -98,6 +112,8 @@ impl Harness {
             Self::Claude => claude::start(run, address, token, &prompt),
             Self::Agy => agy::start(run, address, token, &prompt),
             Self::Opencode => opencode::start(run, address, token, &prompt),
+            Self::Grok => grok::start(run, address, token, &prompt),
+            Self::Muse => muse::start(run, address, token, &prompt),
         }
     }
 
@@ -111,6 +127,8 @@ impl Harness {
             Self::Claude => claude::start_query(query),
             Self::Agy => agy::start_query(query),
             Self::Opencode => opencode::start_query(query),
+            Self::Grok => grok::start_query(query),
+            Self::Muse => muse::start_query(query),
         }?;
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut message = None;
@@ -166,6 +184,26 @@ pub struct Query<'a> {
     pub schema: &'a Path,
     pub prompt: &'a str,
     pub image: Option<&'a Path>,
+}
+
+pub struct Workspace(pub PathBuf);
+
+impl Workspace {
+    pub fn new() -> Result<Self> {
+        let workspace = Self(crate::unique_output(&std::env::temp_dir())?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&workspace.0, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(workspace)
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 pub struct Model {
@@ -356,8 +394,8 @@ pub enum Event {
 pub struct Process<E = Event> {
     child: Child,
     pub events: Receiver<E>,
-    reader: Option<thread::JoinHandle<()>>,
-    agy_config: Option<agy::WorkspaceConfig>,
+    readers: Vec<thread::JoinHandle<()>>,
+    workspace: Option<Box<dyn Send>>,
 }
 
 impl<E: Send + 'static> Process<E> {
@@ -403,25 +441,40 @@ impl<E: Send + 'static> Process<E> {
         Ok(Self {
             child,
             events,
-            reader: Some(reader),
-            agy_config: None,
+            readers: vec![reader],
+            workspace: None,
         })
     }
 
     pub fn status(&mut self) -> Result<Option<ExitStatus>> {
         let status = self.child.try_wait()?;
-        if status.is_some()
-            && let Some(reader) = self.reader.take()
-        {
-            let _ = reader.join();
+        if status.is_some() {
+            for reader in self.readers.drain(..) {
+                let _ = reader.join();
+            }
         }
         Ok(status)
     }
 }
 
 impl Process {
-    pub fn with_agy_config(mut self, config: agy::WorkspaceConfig) -> Self {
-        self.agy_config = Some(config);
+    pub fn with_stderr_filter(mut self, show: impl Fn(&str) -> bool + Send + 'static) -> Self {
+        let stderr = self.child.stderr.take().expect("piped stderr");
+        self.readers.push(thread::spawn(move || {
+            for line in BufReader::new(stderr)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                if show(&line) {
+                    eprintln!("{line}");
+                }
+            }
+        }));
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: impl Send + 'static) -> Self {
+        self.workspace = Some(Box::new(workspace));
         self
     }
 }

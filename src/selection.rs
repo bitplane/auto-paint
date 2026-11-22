@@ -150,9 +150,9 @@ fn choose_with_schema(
             "List {IDEA_COUNT} very different concrete painting ideas for the category {category_name:?}. \
              Each should be a recognisable scene that fits a 720 by 480 canvas and can be \
              drawn with simple shapes and a few colours. Write the subject as a short noun phrase. \
-             For each idea, write an opening of one short, spontaneous first-person sentence you \
-             would say aloud if you'd just decided to draw it. Name the subject and say what makes \
-             it appealing to draw. Vary the phrasing across the ideas. Keep each opening under 120 characters."
+             For each idea, write one short line saying what you'll paint. Name the subject and \
+             stop there. Use natural spoken wording and vary it across the ideas. Keep each opening \
+             under 80 characters."
         ),
     )?;
     Ok((category, idea))
