@@ -155,7 +155,7 @@ impl Server {
         if line.trim_end() != self.token {
             return Err("Invalid tool session token".into());
         }
-        connection.set_read_timeout(Some(Duration::from_secs(900)))?;
+        connection.set_read_timeout(None)?;
 
         let mut remaining = turns;
         loop {

@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use winit::keyboard::Key;
 
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
-const RUN_LIMIT: Duration = Duration::from_secs(900);
 const BATCH_LIMIT: Duration = Duration::from_secs(40);
 const CLICK_HOLD: Duration = Duration::from_millis(35);
 const WAIT_TAIL: Duration = Duration::from_millis(500);
@@ -54,7 +53,7 @@ struct Drawing<'a> {
     trim_waits: bool,
     wait_cutoff: Option<Instant>,
     last_frame: Option<u64>,
-    deadline: Instant,
+    batch_deadline: Option<Instant>,
     pointer: Point,
     narration: Option<Narration>,
     subject: Option<String>,
@@ -75,7 +74,6 @@ impl<'a> Drawing<'a> {
         let overlays = (run.options.narrate || !run.model().is_empty())
             .then(|| Overlays::new(model, effort))
             .transpose()?;
-        let now = Instant::now();
         let mut drawing = Self {
             session,
             video,
@@ -85,7 +83,7 @@ impl<'a> Drawing<'a> {
             trim_waits: !run.options.real_time,
             wait_cutoff: None,
             last_frame: None,
-            deadline: now + RUN_LIMIT,
+            batch_deadline: None,
             pointer: Point { x: -1, y: -1 },
             narration,
             subject: None,
@@ -147,8 +145,11 @@ impl<'a> Drawing<'a> {
         if self.cancelled.load(Ordering::Relaxed) {
             return Err("Drawing cancelled".into());
         }
-        if Instant::now() >= self.deadline {
-            return Err("Drawing exceeded its time limit".into());
+        if self
+            .batch_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err("Action batch exceeded its time limit".into());
         }
         Ok(())
     }
@@ -277,13 +278,12 @@ impl<'a> Drawing<'a> {
         if let Some(line) = line {
             self.cue(line);
         }
-        let deadline = self.deadline;
-        self.deadline = deadline.min(Instant::now() + BATCH_LIMIT);
+        self.batch_deadline = Some(Instant::now() + BATCH_LIMIT);
         let result = batch
             .actions
             .into_iter()
             .try_for_each(|action| self.act(action));
-        self.deadline = deadline;
+        self.batch_deadline = None;
         result
     }
 
