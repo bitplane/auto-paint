@@ -93,17 +93,17 @@ pub fn start_query(query: Query<'_>) -> Result<Process> {
     Ok(Process::spawn(command, &[], selection_events)?.with_workspace(config))
 }
 
-fn exec_command(directory: &Path, model: &str, effort: Option<Effort>, drawing: bool) -> Command {
+fn exec_command(directory: &Path, model: &str, effort: Option<Effort>, images: bool) -> Command {
     let mut deny = vec![
         "command(*)",
-        "read_file(*)",
         "write_file(*)",
         "read_url(*)",
         "execute_url(*)",
     ];
-    let allow = if drawing {
+    let allow = if images {
         vec!["mcp(paintrs/*)"]
     } else {
+        deny.push("read_file(*)");
         deny.push("mcp(*)");
         Vec::new()
     };
@@ -137,17 +137,25 @@ pub struct WorkspaceConfig {
 }
 
 impl WorkspaceConfig {
-    fn new(directory: &Path, drawing: bool) -> Result<Self> {
+    fn new(directory: &Path, images: bool) -> Result<Self> {
         let directory = directory.join(".agents");
         fs::create_dir(&directory)?;
         let config = Self { directory };
         let agents = config.directory.join("agents");
         fs::create_dir(&agents)?;
+        let tools = if images { "tools: [view_file]\n" } else { "" };
+        let image_instructions = if images {
+            "\n\nIf a Paintrs tool returns a Resource offloaded to file:// message, \
+             open that image with the built-in file reader before continuing. \
+             Pass the absolute file path without the file:// prefix."
+        } else {
+            ""
+        };
         let agent = format!(
             "---\nname: auto-paint\ndescription: Draw pictures in Paintrs and suggest painting subjects.\n\
-             mainAgent: true\nsubagent: false\ninheritMcp: {drawing}\nexcludeDefaultComponents: true\n\
-             commandExecutionPolicy: 'off'\n---\n\n\
-             You are the artist in Auto Paint. Follow the drawing or subject selection request directly."
+             mainAgent: true\nsubagent: false\ninheritMcp: {images}\nexcludeDefaultComponents: true\n\
+             {tools}commandExecutionPolicy: 'off'\n---\n\n\
+             You are the artist in Auto Paint. Follow the drawing or subject selection request directly.{image_instructions}"
         );
         fs::write(agents.join("auto-paint.md"), agent)?;
         Ok(config)
