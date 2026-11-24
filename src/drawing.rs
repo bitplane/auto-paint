@@ -1,5 +1,5 @@
 use crate::harness::{Event, Harness};
-use crate::mcp::{Action, Batch, Button, Command, Point, Server};
+use crate::mcp::{Action, Batch, Button, Command, Point, Server, ToolError};
 use crate::narration::Narration;
 use crate::overlay::Overlays;
 use crate::video::Video;
@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use winit::keyboard::Key;
 
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
-const BATCH_LIMIT: Duration = Duration::from_secs(40);
 const CLICK_HOLD: Duration = Duration::from_millis(35);
 const WAIT_TAIL: Duration = Duration::from_millis(500);
 
@@ -53,7 +52,6 @@ struct Drawing<'a> {
     trim_waits: bool,
     wait_cutoff: Option<Instant>,
     last_frame: Option<u64>,
-    batch_deadline: Option<Instant>,
     pointer: Point,
     narration: Option<Narration>,
     subject: Option<String>,
@@ -83,7 +81,6 @@ impl<'a> Drawing<'a> {
             trim_waits: !run.options.real_time,
             wait_cutoff: None,
             last_frame: None,
-            batch_deadline: None,
             pointer: Point { x: -1, y: -1 },
             narration,
             subject: None,
@@ -144,12 +141,6 @@ impl<'a> Drawing<'a> {
     fn check_active(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Relaxed) {
             return Err("Drawing cancelled".into());
-        }
-        if self
-            .batch_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err("Action batch exceeded its time limit".into());
         }
         Ok(())
     }
@@ -224,17 +215,25 @@ impl<'a> Drawing<'a> {
         &mut self,
         command: Command,
         opening: Option<&str>,
-    ) -> std::result::Result<Vec<u8>, String> {
+    ) -> std::result::Result<Vec<u8>, ToolError> {
         match command {
-            Command::Screenshot => self.session.screenshot(),
+            Command::Screenshot => self.session.screenshot().map_err(ToolError::new),
             Command::Act(batch) => {
                 self.end_model_wait(Instant::now());
-                let response = self
-                    .batch(batch, opening)
-                    .map_err(|error| error.to_string())
-                    .and_then(|()| self.session.screenshot());
+                let result = self.batch(batch, opening);
+                let screenshot = self.session.screenshot();
                 self.begin_model_wait(Instant::now());
-                response
+                match result {
+                    Ok(()) => screenshot.map_err(|error| {
+                        ToolError::new(format!(
+                            "All actions completed, but the screenshot failed ({error})."
+                        ))
+                    }),
+                    Err(message) => Err(ToolError {
+                        message,
+                        screenshot: screenshot.ok(),
+                    }),
+                }
             }
         }
     }
@@ -259,10 +258,13 @@ impl<'a> Drawing<'a> {
         }
     }
 
-    fn batch(&mut self, batch: Batch, opening: Option<&str>) -> Result<()> {
-        if !(1..=128).contains(&batch.actions.len()) {
-            return Err("An action batch needs 1 to 128 actions".into());
+    fn batch(&mut self, batch: Batch, opening: Option<&str>) -> std::result::Result<(), String> {
+        let total = batch.actions.len();
+        if !(1..=128).contains(&total) {
+            return Err("No actions ran. An action batch needs 1 to 128 actions.".into());
         }
+        self.check_active()
+            .map_err(|error| format!("No actions ran ({error})."))?;
         let line = if self.start.is_none() {
             self.subject = batch
                 .subject
@@ -274,17 +276,20 @@ impl<'a> Drawing<'a> {
         } else {
             batch.narration.as_deref()
         };
-        self.start_recording()?;
+        self.start_recording()
+            .map_err(|error| format!("No actions ran ({error})."))?;
         if let Some(line) = line {
             self.cue(line);
         }
-        self.batch_deadline = Some(Instant::now() + BATCH_LIMIT);
-        let result = batch
-            .actions
-            .into_iter()
-            .try_for_each(|action| self.act(action));
-        self.batch_deadline = None;
-        result
+        for (index, action) in batch.actions.into_iter().enumerate() {
+            self.act(action).map_err(|error| {
+                format!(
+                    "Action {} of {total} failed ({error}). Completed {index} of {total} actions. The failed action may have partly applied. Later actions did not run.",
+                    index + 1
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn cue(&mut self, line: &str) {
@@ -537,6 +542,53 @@ fn parse_keys(keys: &[String]) -> Result<(Key, Modifiers)> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn a_failed_action_reports_progress_and_shows_the_partial_batch() -> Result<()> {
+        let workspace = crate::harness::Workspace::new()?;
+        let run = Run {
+            options: crate::Options::parse_from(["auto-paint", "--no-narrate"]),
+            model: String::new(),
+            output: workspace.0.clone(),
+            prompt: String::new(),
+            reference: None,
+            opening: None,
+        };
+        let mut drawing = Drawing::new(&run, Arc::new(AtomicBool::new(false)), None)?;
+        let error = drawing
+            .command(
+                Command::Act(Batch {
+                    actions: vec![
+                        Action::Click {
+                            x: 127,
+                            y: 105,
+                            button: Button::Left,
+                        },
+                        Action::Move { x: 942, y: 586 },
+                        Action::Move {
+                            x: WIDTH as i32,
+                            y: 105,
+                        },
+                        Action::Click {
+                            x: 130,
+                            y: 105,
+                            button: Button::Left,
+                        },
+                    ],
+                    narration: None,
+                    subject: None,
+                }),
+                None,
+            )
+            .expect_err("the pointer outside the window must fail");
+        assert!(error.message.contains("Action 3 of 4 failed"));
+        assert!(error.message.contains("Completed 2 of 4 actions"));
+        assert_eq!(error.screenshot, Some(drawing.session.screenshot()?));
+        let row = 105 * WIDTH as usize;
+        assert_eq!(drawing.session.pixels()[row + 127], 0);
+        assert_eq!(drawing.session.pixels()[row + 130], 0xffffff);
+        Ok(())
+    }
 
     #[test]
     fn a_model_wait_keeps_speech_and_a_short_pause() -> Result<()> {

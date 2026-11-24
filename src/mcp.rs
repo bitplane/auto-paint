@@ -83,7 +83,30 @@ pub struct Batch {
 
 pub struct Request {
     pub command: Command,
-    pub reply: SyncSender<std::result::Result<Vec<u8>, String>>,
+    pub reply: SyncSender<std::result::Result<Vec<u8>, ToolError>>,
+}
+
+#[derive(Debug)]
+pub struct ToolError {
+    pub message: String,
+    pub screenshot: Option<Vec<u8>>,
+}
+
+impl ToolError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            screenshot: None,
+        }
+    }
+
+    fn response(self) -> Value {
+        let mut content = vec![json!({"type": "text", "text": self.message})];
+        if let Some(screenshot) = self.screenshot {
+            content.push(image_content(&screenshot, "image/png"));
+        }
+        json!({"isError": true, "content": content})
+    }
 }
 
 pub enum Command {
@@ -179,11 +202,11 @@ impl Server {
                 Some("tools/call") => match (params["name"].as_str(), reference) {
                     (Some("reference"), Some(path)) => match reference_image(path) {
                         Ok(image) => image,
-                        Err(error) => tool_error(&error.to_string()),
+                        Err(error) => ToolError::new(error.to_string()).response(),
                     },
                     _ => match call(send, params, &mut remaining) {
                         Ok(image) => image_response(&image, "image/png"),
-                        Err(error) => tool_error(&error),
+                        Err(error) => error.response(),
                     },
                 },
                 _ => {
@@ -212,36 +235,38 @@ fn reference_image(path: &Path) -> Result<Value> {
 }
 
 fn image_response(image: &[u8], media_type: &str) -> Value {
-    json!({"content": [{"type": "image", "data": STANDARD.encode(image), "mimeType": media_type}]})
+    json!({"content": [image_content(image, media_type)]})
 }
 
-fn tool_error(error: &str) -> Value {
-    json!({"isError": true, "content": [{"type": "text", "text": error}]})
+fn image_content(image: &[u8], media_type: &str) -> Value {
+    json!({"type": "image", "data": STANDARD.encode(image), "mimeType": media_type})
 }
 
 fn call(
     send: &SyncSender<Request>,
     params: &Value,
     remaining: &mut u32,
-) -> std::result::Result<Vec<u8>, String> {
+) -> std::result::Result<Vec<u8>, ToolError> {
     let command = match params["name"].as_str() {
         Some("screenshot") => Command::Screenshot,
         Some("act") => Command::Act(
             serde_json::from_value(params["arguments"].clone())
-                .map_err(|error| format!("Invalid actions: {error}"))?,
+                .map_err(|error| ToolError::new(format!("No actions ran ({error}).")))?,
         ),
-        _ => return Err("Unknown Paintrs tool".into()),
+        _ => return Err(ToolError::new("Unknown Paintrs tool")),
     };
     if *remaining == 0 {
-        return Err("Reached the drawing step limit. Finish drawing.".into());
+        return Err(ToolError::new(
+            "Reached the drawing step limit. Finish drawing.",
+        ));
     }
     *remaining -= 1;
     let (reply, result) = mpsc::sync_channel(1);
     send.send(Request { command, reply })
-        .map_err(|_| "The drawing session has ended")?;
+        .map_err(|_| ToolError::new("The drawing session has ended"))?;
     result
-        .recv_timeout(Duration::from_secs(50))
-        .map_err(|_| "The drawing session did not respond")?
+        .recv()
+        .map_err(|_| ToolError::new("The drawing session ended before replying"))?
 }
 
 fn tools(drawing: bool, reference: bool) -> Vec<Value> {
@@ -255,7 +280,7 @@ fn tools(drawing: bool, reference: bool) -> Vec<Value> {
             }),
             json!({
                 "name": "act",
-                "description": "Perform mouse and keyboard actions in Paintrs and see the result. Clicks and moves take x and y. Drags take a path of x/y points. Keypress takes keys like ['CTRL','Z']. Type takes text. Scroll takes x, y and scroll_x or scroll_y. Wait takes milliseconds. For a polygon, choose the Polygon tool to the right of Rectangle. Drag the first edge only, then click each remaining vertex once and press Enter to close the shape. A single drag around the outline does not add vertices. Choose the bottom fill option before drawing for a solid foreground-color polygon.",
+                "description": "Perform mouse and keyboard actions in Paintrs and see the result. If an action fails, use the screenshot and completed-action count to continue from the current state. Clicks and moves take x and y. Drags take a path of x/y points. Keypress takes keys like ['CTRL','Z']. Type takes text. Scroll takes x, y and scroll_x or scroll_y. Wait takes milliseconds. For a polygon, choose the Polygon tool to the right of Rectangle. Drag the first edge only, then click each remaining vertex once and press Enter to close the shape. A single drag around the outline does not add vertices. Choose the bottom fill option before drawing for a solid foreground-color polygon.",
                 "inputSchema": {
                     "type": "object", "required": ["actions"], "additionalProperties": false,
                     "properties": {
