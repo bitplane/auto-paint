@@ -130,7 +130,6 @@ impl Harness {
             Self::Grok => grok::start_query(query),
             Self::Muse => muse::start_query(query),
         }?;
-        let deadline = Instant::now() + Duration::from_secs(90);
         let mut message = None;
         let mut usage = None;
         let mut error = None;
@@ -160,9 +159,6 @@ impl Harness {
                     })?,
                     usage,
                 ));
-            }
-            if Instant::now() >= deadline {
-                return Err("Timed out waiting for a model response".into());
             }
             thread::sleep(Duration::from_millis(50));
         }
