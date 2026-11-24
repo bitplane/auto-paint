@@ -1,5 +1,4 @@
 use crate::harness::{self, Effort, Event, Model, Process, Query};
-use crate::mcp::Server;
 use crate::{Result, Run};
 use serde_json::{Value, json};
 use std::fs;
@@ -52,13 +51,14 @@ fn parse_model(line: &str) -> Option<Model> {
 }
 
 pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Result<Process> {
-    let config = WorkspaceConfig::new(&run.output, true)?;
+    let input = AgentInput::Drawing;
+    let config = WorkspaceConfig::new(&run.output, input)?;
     let mut tools = vec!["screenshot", "act"];
     if run.reference.is_some() {
         tools.push("reference");
     }
     config.write_mcp(address, &tools)?;
-    let mut command = exec_command(&run.output, run.model(), run.options.effort, true);
+    let mut command = exec_command(&run.output, run.model(), run.options.effort, input);
     command.env("AUTO_PAINT_MCP_TOKEN", token);
     let prompt = if run.reference.is_some() {
         format!(
@@ -72,17 +72,16 @@ pub fn start(run: &Run, address: SocketAddr, token: &str, prompt: &str) -> Resul
 }
 
 pub fn start_query(query: Query<'_>) -> Result<Process> {
-    let image = query.image;
-    let config = WorkspaceConfig::new(query.directory, image.is_some())?;
-    let mut command = exec_command(query.directory, query.model, query.effort, image.is_some());
-    let image_instruction = if let Some(image) = image {
-        let server = Server::bind()?;
-        config.write_mcp(server.address, &["reference"])?;
-        command.env("AUTO_PAINT_MCP_TOKEN", &server.token);
-        drop(server.start(0, Some(image.to_owned()))?);
-        "\nCall the Paintrs reference tool to see the image for this task."
-    } else {
-        ""
+    let image = query.image.map(Path::canonicalize).transpose()?;
+    let input = image.as_deref().map_or(AgentInput::Text, AgentInput::Image);
+    let config = WorkspaceConfig::new(query.directory, input)?;
+    let mut command = exec_command(query.directory, query.model, query.effort, input);
+    let image_instruction = match &image {
+        Some(path) => format!(
+            "\nOpen the image at {:?} with the built-in file reader before answering.",
+            path.display().to_string()
+        ),
+        None => String::new(),
     };
     let schema = fs::read_to_string(query.schema)?;
     let prompt = format!(
@@ -93,19 +92,35 @@ pub fn start_query(query: Query<'_>) -> Result<Process> {
     Ok(Process::spawn(command, &[], selection_events)?.with_workspace(config))
 }
 
-fn exec_command(directory: &Path, model: &str, effort: Option<Effort>, images: bool) -> Command {
+#[derive(Clone, Copy)]
+enum AgentInput<'a> {
+    Drawing,
+    Image(&'a Path),
+    Text,
+}
+
+fn exec_command(
+    directory: &Path,
+    model: &str,
+    effort: Option<Effort>,
+    input: AgentInput<'_>,
+) -> Command {
     let mut deny = vec![
         "command(*)",
         "write_file(*)",
         "read_url(*)",
         "execute_url(*)",
     ];
-    let allow = if images {
-        vec!["mcp(paintrs/*)"]
-    } else {
-        deny.push("read_file(*)");
-        deny.push("mcp(*)");
-        Vec::new()
+    let allow = match input {
+        AgentInput::Drawing => vec!["mcp(paintrs/*)".to_owned()],
+        AgentInput::Image(path) => {
+            deny.push("mcp(*)");
+            vec![format!("read_file({})", path.display())]
+        }
+        AgentInput::Text => {
+            deny.extend(["read_file(*)", "mcp(*)"]);
+            Vec::new()
+        }
     };
     let settings = json!({
         "agentMode": "",
@@ -137,14 +152,19 @@ pub struct WorkspaceConfig {
 }
 
 impl WorkspaceConfig {
-    fn new(directory: &Path, images: bool) -> Result<Self> {
+    fn new(directory: &Path, input: AgentInput<'_>) -> Result<Self> {
         let directory = directory.join(".agents");
         fs::create_dir(&directory)?;
         let config = Self { directory };
         let agents = config.directory.join("agents");
         fs::create_dir(&agents)?;
-        let tools = if images { "tools: [view_file]\n" } else { "" };
-        let image_instructions = if images {
+        let drawing = matches!(input, AgentInput::Drawing);
+        let tools = if matches!(input, AgentInput::Text) {
+            ""
+        } else {
+            "tools: [view_file]\n"
+        };
+        let image_instructions = if drawing {
             "\n\nIf a Paintrs tool returns a Resource offloaded to file:// message, \
              open that image with the built-in file reader before continuing. \
              Pass the absolute file path without the file:// prefix."
@@ -153,7 +173,7 @@ impl WorkspaceConfig {
         };
         let agent = format!(
             "---\nname: auto-paint\ndescription: Draw pictures in Paintrs and suggest painting subjects.\n\
-             mainAgent: true\nsubagent: false\ninheritMcp: {images}\nexcludeDefaultComponents: true\n\
+             mainAgent: true\nsubagent: false\ninheritMcp: {drawing}\nexcludeDefaultComponents: true\n\
              {tools}commandExecutionPolicy: 'off'\n---\n\n\
              You are the artist in Auto Paint. Follow the drawing or subject selection request directly.{image_instructions}"
         );
