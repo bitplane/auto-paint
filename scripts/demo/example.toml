@@ -1,0 +1,34 @@
+title = "Local Models Paintrs demo"
+# date = "November 2026"
+speed = 8
+# paintrs_version = "…"                  # Default for runs without version metadata
+
+[[runs]]
+# Directories are relative to this manifest. Entries play in the order listed.
+directory = "runs/smoke"
+title = "Local smoke test"
+command = "auto-paint --smoke-test --no-watch"
+
+# Add more [[runs]] entries for your recordings.
+# harness = "opencode"
+# model_arg = "provider/model-id"
+# effort = "high"
+# paintrs_version = "…"                  # Per-run override for a mixed-version video
+# elapsed_seconds = 98.2                  # For a recording made without the wrapper
+# cost_usd = 0.042                        # Optional estimate you already calculated
+# cost_label = "Estimated API cost"
+#
+# Or estimate from provider rates per million tokens, in USD.
+# [runs.pricing]
+# input_per_million = 0.20
+# cached_input_per_million = 0.02
+# cache_write_per_million = 0.20
+# output_per_million = 0.80
+#
+# Override individual counts or supply them for an external recording.
+# [runs.tokens]
+# input = 8200
+# cached = 6400
+# written = 0
+# output = 690
+# reasoning = 230

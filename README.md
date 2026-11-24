@@ -8,3 +8,5 @@ Use `--harness` to switch to `claude`, `agy`, `opencode`, `grok`, or `muse`,
 and `--model` to match on a model name.
 
 See `auto-paint --help` for more info
+
+[Build benchmark videos](scripts/demo/README.md)
